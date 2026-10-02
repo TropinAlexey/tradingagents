@@ -2,8 +2,9 @@
 
 Unit-scoped: no network, no ccxt, no yfinance — the universe builders are
 faked at the module seam and the screen runs on synthetic OHLCV frames. The
-metrics contract is asserted exactly (momentum/trend/volume math) because the
-score gates which instruments earn an LLM pipeline run.
+research-backed criteria (momentum, RSI band, 52-week proximity, breakout,
+RVOL, ATR% band, dollar-volume floor) are asserted through the candidate's
+flags/reasons so the score weights stay tunable without rewriting tests.
 """
 
 import pandas as pd
@@ -14,61 +15,84 @@ from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 
 pytestmark = pytest.mark.unit
 
+# Volume large enough that flat-price fixtures clear the stock dollar-volume
+# floor (close 100 * volume 200k = 20M >= 10M).
+_FLAT_VOLUME = 200_000.0
 
-def _ohlcv_frame(closes: list[float], volumes: list[float] | None = None) -> pd.DataFrame:
-    dates = pd.date_range("2026-09-01", periods=len(closes), freq="D")
-    data = {"Date": dates, "Close": closes}
-    if volumes is None:
-        volumes = [1000.0] * len(closes)
-    data["Volume"] = volumes
+
+def _ohlcv_frame(
+    closes: list[float],
+    volumes: list[float] | None = None,
+) -> pd.DataFrame:
+    dates = pd.date_range("2026-06-01", periods=len(closes), freq="D")
+    closes_s = pd.Series(closes)
+    data = {
+        "Date": dates,
+        "Open": closes_s.shift(1).fillna(closes_s.iloc[0]),
+        "High": closes_s * 1.01,
+        "Low": closes_s * 0.99,
+        "Close": closes_s,
+        "Volume": pd.Series(volumes if volumes is not None else [_FLAT_VOLUME] * len(closes)),
+    }
     return pd.DataFrame(data)
 
 
-def test_screen_one_scores_strong_uptrend_with_volume(monkeypatch):
-    """20 rising closes ending high on a volume spike cross all three gates."""
-    closes = [100.0 + i for i in range(20)] + [135.0]  # momentum 35%, above SMA20
-    volumes = [1000.0] * 20 + [2500.0]
+def _uptrend(days: int = 60, step: float = 1.0) -> list[float]:
+    """Steady rise with a final jump past the prior day's high — the breakout
+    context the screen is meant to catch (a flat step never clears High =
+    close*1.01 of the previous day)."""
+    return [100.0 + i * step for i in range(days - 1)] + [100.0 + days * step]
+
+
+def test_screen_one_uptrend_with_volume_spike_flags_all_signals(monkeypatch):
+    """60 rising closes on a final volume spike trip momentum, trend stack,
+    RVOL, breakout, 52-week proximity and the ATR band at once."""
+    closes = _uptrend()
+    volumes = [_FLAT_VOLUME] * 59 + [_FLAT_VOLUME * 3]
     monkeypatch.setattr(
         screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes, volumes)
     )
-    candidate = screening.screen_one("BTC-USD", "2026-10-01")
+    candidate = screening.screen_one(
+        "BTC-USD", "2026-10-01", asset_type="crypto", benchmark_momentum=0.0
+    )
     assert candidate is not None
     assert candidate.asset_type == "crypto"
-    assert candidate.score == pytest.approx(4.0)  # 2 (capped) + 1 trend + 1 volume
-    assert candidate.momentum_pct == pytest.approx(35.0)
-    assert candidate.trend_pct > 2
-    # the window includes the spike itself: mean = (19*1000 + 2500)/20 = 1075
-    assert candidate.volume_ratio == pytest.approx(2500 / 1075, rel=1e-3)
-    assert any("SMA20" in reason for reason in candidate.reasons)
+    assert candidate.breakout is True
+    assert candidate.momentum_pct > 5
+    joined = " | ".join(candidate.reasons)
+    assert "SMA20" in joined
+    assert "SMA50" in joined
+    assert "RVOL" in joined
+    assert "52 tuần" in joined
+    assert "phá đỉnh 20 phiên" in joined
+    assert "mạnh hơn benchmark" in joined
+    assert candidate.score > 3.0
 
 
-def test_screen_one_flat_series_scores_zero_and_no_reasons(monkeypatch):
-    closes = [100.0] * 25
+def test_screen_one_flat_series_has_no_signal_reasons(monkeypatch):
+    closes = [100.0] * 60
     monkeypatch.setattr(
         screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes)
     )
-    candidate = screening.screen_one("NVDA", "2026-10-01")
-    assert candidate is not None
-    assert candidate.score == 0.0
-    assert candidate.reasons == []
-    assert candidate.asset_type == "stock"
-
-
-def test_screen_one_known_crypto_base_gets_crypto_type(monkeypatch):
-    closes = [100.0] * 25
-    monkeypatch.setattr(
-        screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes)
+    candidate = screening.screen_one(
+        "NVDA", "2026-10-01", asset_type="stock", benchmark_momentum=0.0
     )
-    candidate = screening.screen_one("ETH-USD", "2026-10-01")
     assert candidate is not None
-    assert candidate.asset_type == "crypto"  # ETH is in the pipeline's closed set
+    joined = " | ".join(candidate.reasons)
+    assert "trong 20 phiên" not in joined  # momentum neutral
+    assert "SMA20" not in joined
+    assert "RVOL" not in joined
+    assert "phá đỉnh" not in joined
 
 
-def test_screen_one_thin_data_returns_none(monkeypatch):
+def test_screen_one_thin_history_returns_none(monkeypatch):
     monkeypatch.setattr(
-        screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame([100.0, 101.0])
+        screening, "load_ohlcv",
+        lambda ticker, date, fill_gaps: _ohlcv_frame([100.0 + i for i in range(40)]),
     )
-    assert screening.screen_one("NVDA", "2026-10-01") is None
+    assert screening.screen_one(
+        "NVDA", "2026-10-01", asset_type="stock", benchmark_momentum=0.0
+    ) is None
 
 
 def test_screen_one_vendor_error_returns_none_not_raised(monkeypatch):
@@ -76,35 +100,84 @@ def test_screen_one_vendor_error_returns_none_not_raised(monkeypatch):
         raise NoMarketDataError(ticker, ticker, "no rows")
 
     monkeypatch.setattr(screening, "load_ohlcv", boom)
-    assert screening.screen_one("AAPL", "2026-10-01") is None
+    assert screening.screen_one(
+        "AAPL", "2026-10-01", asset_type="stock", benchmark_momentum=0.0
+    ) is None
+
+
+def test_screen_one_illiquid_candidate_is_gated_out(monkeypatch):
+    """Below the daily dollar-volume floor the candidate is dropped entirely —
+    transaction costs erase the momentum edge down there (Starkiller)."""
+    closes = _uptrend()
+    monkeypatch.setattr(
+        screening, "load_ohlcv",
+        lambda ticker, date, fill_gaps: _ohlcv_frame(closes, volumes=[50_000.0] * 60),
+    )
+    assert screening.screen_one(
+        "AAPL", "2026-10-01", asset_type="stock", benchmark_momentum=0.0
+    ) is None
+
+
+def test_screen_one_overextended_rvol_is_penalized(monkeypatch):
+    closes = _uptrend()
+    volumes = [_FLAT_VOLUME] * 59 + [_FLAT_VOLUME * 6]
+    monkeypatch.setattr(
+        screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes, volumes)
+    )
+    candidate = screening.screen_one(
+        "BTC-USD", "2026-10-01", asset_type="crypto", benchmark_momentum=0.0
+    )
+    assert candidate is not None
+    assert candidate.volume_ratio >= 4.0
+    assert any("RVOL >4" in reason for reason in candidate.reasons)
+
+
+def test_screen_one_parabolic_run_flags_chasing(monkeypatch):
+    """A monotonic run has RSI at its ceiling — the screen must say so instead
+    of rewarding the chase."""
+    closes = _uptrend(step=2.0)
+    monkeypatch.setattr(
+        screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes)
+    )
+    candidate = screening.screen_one(
+        "MOVR-USD", "2026-10-01", asset_type="crypto", benchmark_momentum=0.0
+    )
+    assert candidate is not None
+    assert candidate.rsi14 is not None and candidate.rsi14 >= 75
+    assert any("đu đỉnh" in reason for reason in candidate.reasons)
 
 
 def test_screen_universe_ranks_and_truncates(monkeypatch):
     def fake_load(ticker, date, fill_gaps):
         if ticker == "HI":
-            return _ohlcv_frame([100.0 + i * 2 for i in range(21)])
+            return _ohlcv_frame(_uptrend(step=2.0))
         if ticker == "MID":
-            return _ohlcv_frame([100.0 + i * 0.5 for i in range(21)])
-        return _ohlcv_frame([100.0] * 21)  # LO flat → score 0, still a candidate
+            return _ohlcv_frame(_uptrend(step=0.5))
+        return _ohlcv_frame([100.0] * 60)  # LO flat
 
     monkeypatch.setattr(screening, "load_ohlcv", fake_load)
     ranked = screening.screen_universe(["LO", "HI"], ["MID"], "2026-10-01", top_n=2)
     assert len(ranked) == 2
     assert ranked[0]["ticker"] == "HI"
     assert ranked[1]["ticker"] == "MID"
+    assert ranked[0]["asset_type"] == "crypto"
+    assert ranked[1]["asset_type"] == "stock"
 
 
 def test_screen_universe_keeps_universe_asset_type_for_off_set_crypto(monkeypatch):
     """Liquid crypto outside the closed executable set (QNT-USD) must keep the
     crypto type from its universe, not fall back to closed-set inference."""
-    closes = [100.0 + i * 2 for i in range(21)]
+    closes = _uptrend()
+    volumes = [_FLAT_VOLUME] * 59 + [_FLAT_VOLUME * 3]
     monkeypatch.setattr(
-        screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes)
+        screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes, volumes)
     )
     ranked = screening.screen_universe(["QNT-USD"], [], "2026-10-01", top_n=5)
     (candidate,) = ranked
     assert candidate["ticker"] == "QNT-USD"
     assert candidate["asset_type"] == "crypto"
+    assert candidate["rsi14"] is not None
+    assert candidate["breakout"] is True
 
 
 def test_crypto_universe_via_module_seam(monkeypatch):

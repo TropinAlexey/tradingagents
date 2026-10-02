@@ -47,9 +47,10 @@ _PROPAGATE_ATTEMPTS = 3
 # the engine's unattended runner (execution/daily.py:62).
 PROPAGATE_RETRY_WAIT = 20.0
 
-# Auto-scan tuning: how many universe entries to pull per market, and how many
+# Auto-scan tuning: how many universe entries to pull per market (freqtrade's
+# VolumePairlist pattern: rank by volume, screen the top-N), and how many
 # screened candidates graduate into the expensive LLM pipeline.
-AUTO_UNIVERSE_PER_ASSET = 12
+AUTO_UNIVERSE_PER_ASSET = 40
 AUTO_DEFAULT_TOP_N = 5
 AUTO_MAX_TOP_N = 20
 
@@ -61,17 +62,27 @@ MOCK_PRICE = 83078.0
 MOCK_CASH = 9500.0
 
 # Mock auto-scan must not touch ccxt/yfinance: a fixed candidate list keeps the
-# demo deterministic and offline, mirroring runs.py's synthetic fallback.
+# demo deterministic and offline, mirroring runs.py's synthetic fallback. Fields
+# mirror screening.Candidate.as_dict().
 MOCK_AUTO_CANDIDATES: tuple[dict, ...] = (
-    {"ticker": "BTC-USD", "asset_type": "crypto", "score": 2.4,
+    {"ticker": "BTC-USD", "asset_type": "crypto", "score": 5.2,
      "last_close": MOCK_PRICE, "momentum_pct": 6.1, "trend_pct": 3.2,
-     "volume_ratio": 1.8, "reasons": ["+6.1% trong 20 phiên", "giá trên SMA20 (xu hướng tăng)"]},
+     "volume_ratio": 2.4, "rsi14": 58.0, "atr_pct": 3.4, "dist_52w_pct": -2.1,
+     "breakout": True, "avg_dollar_volume": 8.2e9,
+     "reasons": ["+6.1% trong 20 phiên", "giá trên SMA20", "trên cả SMA50 (xu hướng tăng kép)",
+                 "RVOL x2.4 (khối lượng đột biến)", "sát đỉnh 52 tuần (chỉ ~2%)",
+                 "phá đỉnh 20 phiên kèm khối lượng"]},
     {"ticker": "ETH-USD", "asset_type": "crypto", "score": 1.1,
      "last_close": 3120.5, "momentum_pct": 2.2, "trend_pct": 1.1,
-     "volume_ratio": 1.2, "reasons": []},
-    {"ticker": "NVDA", "asset_type": "stock", "score": 1.9,
+     "volume_ratio": 1.2, "rsi14": 52.0, "atr_pct": 3.1, "dist_52w_pct": -18.4,
+     "breakout": False, "avg_dollar_volume": 6.1e9, "reasons": []},
+    {"ticker": "NVDA", "asset_type": "stock", "score": 4.6,
      "last_close": 187.4, "momentum_pct": 8.4, "trend_pct": 4.5,
-     "volume_ratio": 1.2, "reasons": ["+8.4% trong 20 phiên", "giá trên SMA20 (xu hướng tăng)"]},
+     "volume_ratio": 2.1, "rsi14": 63.0, "atr_pct": 3.8, "dist_52w_pct": -4.2,
+     "breakout": True, "avg_dollar_volume": 2.4e10,
+     "reasons": ["+8.4% trong 20 phiên", "giá trên SMA20", "trên cả SMA50 (xu hướng tăng kép)",
+                 "RVOL x2.1 (khối lượng đột biến)", "sát đỉnh 52 tuần (chỉ ~4%)",
+                 "phá đỉnh 20 phiên kèm khối lượng"]},
 )
 
 logger = logging.getLogger(__name__)

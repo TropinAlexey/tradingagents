@@ -80,7 +80,9 @@ export type ApiErrorInfo = {
   message: string;
 };
 
-/** Một ứng viên sau khi server sàng lọc thị trường (auto-scan, contract §5 rev 4). */
+/** Một ứng viên sau khi server sàng lọc thị trường (auto-scan, contract §5 rev 4).
+ *  Metrics theo chuẩn screener thực chiến: RSI(14), ATR%, khoảng cách đỉnh 52 tuần,
+ *  RVOL, breakout 20 phiên kèm khối lượng, dollar-volume trung bình 20 phiên. */
 export interface ScreeningCandidate {
   ticker: string;
   asset_type: "crypto" | "stock";
@@ -89,6 +91,11 @@ export interface ScreeningCandidate {
   momentum_pct: number;
   trend_pct: number;
   volume_ratio: number;
+  rsi14: number | null;
+  atr_pct: number | null;
+  dist_52w_pct: number;
+  breakout: boolean;
+  avg_dollar_volume: number;
   reasons: string[];
 }
 

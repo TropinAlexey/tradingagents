@@ -211,10 +211,11 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
         <CardDescription>
           {kind === "auto" ? (
             <>
-              Quét tự động: server tự sàng universe (crypto theo khối lượng
-              sàn + cổ phiếu Mỹ vốn hóa lớn) bằng chỉ báo kỹ thuật, rồi chạy
-              pipeline LLM trên {job?.tickers.length ?? "top"} ứng viên điểm
-              cao nhất — không cần danh sách theo dõi.
+              Quét tự động: server tự sàng universe (crypto top khối lượng sàn
+              + cổ phiếu Mỹ đang mạnh 52 tuần) bằng bộ tiêu chí thực chiến —
+              động lượng, RSI, đỉnh 52 tuần, breakout kèm khối lượng, thanh
+              khoản — rồi chạy pipeline LLM trên {job?.tickers.length ?? "top"}{" "}
+              ứng viên điểm cao nhất. Không cần danh sách theo dõi.
             </>
           ) : (
             <>
@@ -405,9 +406,10 @@ function ScreeningTable({ screening }: { screening: ScreeningInfo }) {
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <Badge variant="outline">Kết quả sàng lọc</Badge>
         <span className="text-muted-foreground">
-          universe: {screening.universe_crypto} crypto +{" "}
-          {screening.universe_stock} cổ phiếu = {screening.universe_count} mã ·
-          top {screening.candidates.length} ứng viên đi tiếp vào pipeline
+          universe: {screening.universe_crypto} crypto (top khối lượng) +{" "}
+          {screening.universe_stock} cổ phiếu (mạnh 52 tuần) ={" "}
+          {screening.universe_count} mã · top {screening.candidates.length}{" "}
+          ứng viên đi tiếp vào pipeline
           {screening.mock ? " (mock)" : ""}
         </span>
       </div>
@@ -422,8 +424,9 @@ function ScreeningTable({ screening }: { screening: ScreeningInfo }) {
               <th scope="col" className="py-2 pr-3 font-medium">Loại</th>
               <th scope="col" className="py-2 pr-3 font-medium">Điểm</th>
               <th scope="col" className="py-2 pr-3 font-medium">Động lượng 20P</th>
-              <th scope="col" className="py-2 pr-3 font-medium">vs SMA20</th>
-              <th scope="col" className="py-2 pr-3 font-medium">KL ×TB</th>
+              <th scope="col" className="py-2 pr-3 font-medium">RSI 14</th>
+              <th scope="col" className="py-2 pr-3 font-medium">RVOL</th>
+              <th scope="col" className="py-2 pr-3 font-medium">vs đỉnh 52T</th>
               <th scope="col" className="py-2 font-medium">Lý do</th>
             </tr>
           </thead>
@@ -432,6 +435,9 @@ function ScreeningTable({ screening }: { screening: ScreeningInfo }) {
               <tr key={candidate.ticker} className="align-top">
                 <td className="py-2 pr-3 font-mono font-medium">
                   {candidate.ticker}
+                  {candidate.breakout ? (
+                    <Badge className="ml-2 align-middle text-xs">Phá đỉnh</Badge>
+                  ) : null}
                 </td>
                 <td className="py-2 pr-3">
                   <Badge variant={candidate.asset_type === "crypto" ? "default" : "secondary"}>
@@ -446,11 +452,13 @@ function ScreeningTable({ screening }: { screening: ScreeningInfo }) {
                   {candidate.momentum_pct.toFixed(1)}%
                 </td>
                 <td className="py-2 pr-3 tabular-nums">
-                  {candidate.trend_pct >= 0 ? "+" : ""}
-                  {candidate.trend_pct.toFixed(1)}%
+                  {candidate.rsi14 != null ? candidate.rsi14.toFixed(0) : "—"}
                 </td>
                 <td className="py-2 pr-3 tabular-nums">
                   ×{candidate.volume_ratio.toFixed(1)}
+                </td>
+                <td className="py-2 pr-3 tabular-nums">
+                  {candidate.dist_52w_pct.toFixed(1)}%
                 </td>
                 <td className="py-2 text-muted-foreground">
                   {candidate.reasons.length > 0
