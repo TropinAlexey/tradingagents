@@ -76,6 +76,15 @@ export const scannerApi = {
       body: "{}",
     });
   },
+  /** Quét tự động (rev 4): server tự sàng universe crypto + stock rồi chạy
+   *  pipeline trên top N ứng viên — không cần watchlist. */
+  startAutoDaily(topN: number): Promise<DailyJobStart> {
+    return requestJson<DailyJobStart>("/api/daily", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ auto: true, top_n: topN }),
+    });
+  },
   dailyJob(jobId: string): Promise<DailyJobStatusResponse> {
     return requestJson<DailyJobStatusResponse>(
       `/api/daily/${encodeURIComponent(jobId)}`,

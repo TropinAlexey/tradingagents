@@ -5,7 +5,7 @@
 // "Đang treo" kèm gợi ý. Dòng tiền lệnh luôn có dấu +/− và nhãn chữ.
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { Loader2, Play, TriangleAlert } from "lucide-react";
+import { Loader2, Play, ScanSearch, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -30,9 +30,11 @@ import type {
   DailyJobStatus,
   DailyJobStatusResponse,
   DailyResultItem,
+  ScreeningInfo,
 } from "./scanner-types";
 
 type Phase = "idle" | "starting" | "running" | "error";
+type ScanKind = "watchlist" | "auto";
 
 const POLL_INTERVAL_MS = 3_000;
 const STUCK_AFTER_MS = 15 * 60_000;
@@ -61,6 +63,11 @@ function ResultRow({ item }: { item: DailyResultItem }) {
         {item.mock_source ? (
           <Badge variant="outline" className="ml-2 align-middle text-xs">
             Mock
+          </Badge>
+        ) : null}
+        {item.asset_type === "stock" ? (
+          <Badge variant="secondary" className="ml-2 align-middle text-xs">
+            Cổ phiếu
           </Badge>
         ) : null}
       </td>
@@ -120,6 +127,7 @@ function ResultRow({ item }: { item: DailyResultItem }) {
 
 export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
   const [phase, setPhase] = useState<Phase>("idle");
+  const [kind, setKind] = useState<ScanKind>("watchlist");
   const [start, setStart] = useState<DailyJobStart | null>(null);
   const [job, setJob] = useState<DailyJobStatusResponse | null>(null);
   const [error, setError] = useState<ApiHttpError | null>(null);
@@ -163,13 +171,17 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
     };
   }, [phase, jobId]);
 
-  const startScan = useCallback(async () => {
+  const startScan = useCallback(async (scanKind: ScanKind) => {
     setPhase("starting");
+    setKind(scanKind);
     setError(null);
     setStart(null);
     setJob(null);
     try {
-      const res = await scannerApi.startDaily();
+      const res =
+        scanKind === "auto"
+          ? await scannerApi.startAutoDaily(5)
+          : await scannerApi.startDaily();
       setStart(res);
       setPhase("running");
     } catch (err) {
@@ -188,27 +200,54 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
     phase === "running" &&
     createdAt !== null &&
     now - Date.parse(createdAt) > STUCK_AFTER_MS;
+  const screening: ScreeningInfo | null | undefined = job?.screening;
+  const screeningEmpty =
+    screening != null && screening.candidates.length === 0;
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>Quét pipeline</CardTitle>
         <CardDescription>
-          Chạy pipeline phân tích cho toàn bộ watchlist hiện hành. Mỗi mã chạy
-          đầy đủ các agent LLM nên job có thể mất nhiều phút.
+          {kind === "auto" ? (
+            <>
+              Quét tự động: server tự sàng universe (crypto theo khối lượng
+              sàn + cổ phiếu Mỹ vốn hóa lớn) bằng chỉ báo kỹ thuật, rồi chạy
+              pipeline LLM trên {job?.tickers.length ?? "top"} ứng viên điểm
+              cao nhất — không cần danh sách theo dõi.
+            </>
+          ) : (
+            <>
+              Chạy pipeline phân tích cho toàn bộ watchlist hiện hành. Mỗi mã
+              chạy đầy đủ các agent LLM nên job có thể mất nhiều phút.
+            </>
+          )}
         </CardDescription>
-        <CardAction>
+        <CardAction className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            className="min-touch"
+            onClick={() => void startScan("auto")}
+            disabled={busy}
+          >
+            {busy && kind === "auto" ? (
+              <Loader2 className="animate-spin" aria-hidden />
+            ) : (
+              <ScanSearch data-icon="inline-start" aria-hidden />
+            )}
+            {busy && kind === "auto" ? "Đang quét thị trường…" : "Quét tự động"}
+          </Button>
           <Button
             className="min-touch"
-            onClick={() => void startScan()}
+            onClick={() => void startScan("watchlist")}
             disabled={symbolsCount === 0 || busy}
           >
-            {busy ? (
+            {busy && kind === "watchlist" ? (
               <Loader2 className="animate-spin" aria-hidden />
             ) : (
               <Play data-icon="inline-start" aria-hidden />
             )}
-            {phase === "running"
+            {busy && kind === "watchlist"
               ? "Đang quét…"
               : phase === "starting"
                 ? "Đang gửi…"
@@ -217,9 +256,28 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-4">
-        {symbolsCount === 0 && phase === "idle" ? (
+        {phase === "running" && kind === "auto" && job == null ? (
+          <p aria-live="polite" className="text-sm text-muted-foreground">
+            Đang sàng thị trường (crypto + cổ phiếu Mỹ)… Bước này chỉ tính chỉ
+            báo, không tốn LLM — sau đó pipeline LLM mới chạy trên các ứng viên
+            điểm cao nhất.
+          </p>
+        ) : null}
+
+        {screening && screening.candidates.length > 0 ? (
+          <ScreeningTable screening={screening} />
+        ) : null}
+        {screeningEmpty ? (
+          <p className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">
+            Bước sàng lọc không cho ứng viên nào đủ điểm — không có mã nào đáng
+            chạy pipeline lúc này. Thử lại sau phiên giao dịch kế tiếp.
+          </p>
+        ) : null}
+
+        {symbolsCount === 0 && phase === "idle" && kind === "watchlist" ? (
           <p className="text-sm text-muted-foreground">
-            Cần ít nhất một mã trong danh sách theo dõi trước khi quét.
+            Cần ít nhất một mã trong danh sách theo dõi trước khi quét — hoặc
+            bấm “Quét tự động” để server tự tìm mã.
           </p>
         ) : null}
 
@@ -331,11 +389,79 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
 
         {phase === "idle" && !job ? (
           <div className="flex h-40 items-center justify-center rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-            Chưa có lần quét nào — bấm “Quét ngay” để chạy pipeline trên
-            watchlist hiện tại.
+            Chưa có lần quét nào — bấm “Quét tự động” (server tự tìm mã) hoặc
+            “Quét ngay” (chạy trên watchlist hiện tại).
           </div>
         ) : null}
       </CardContent>
     </Card>
+  );
+}
+
+/** Bảng ứng viên sau bước sàng lọc kỹ thuật (job auto, contract §5 rev 4). */
+function ScreeningTable({ screening }: { screening: ScreeningInfo }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <Badge variant="outline">Kết quả sàng lọc</Badge>
+        <span className="text-muted-foreground">
+          universe: {screening.universe_crypto} crypto +{" "}
+          {screening.universe_stock} cổ phiếu = {screening.universe_count} mã ·
+          top {screening.candidates.length} ứng viên đi tiếp vào pipeline
+          {screening.mock ? " (mock)" : ""}
+        </span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <caption className="sr-only">
+            Ứng viên sau sàng lọc kỹ thuật, xếp theo điểm
+          </caption>
+          <thead>
+            <tr className="border-b text-left text-xs text-muted-foreground">
+              <th scope="col" className="py-2 pr-3 font-medium">Mã</th>
+              <th scope="col" className="py-2 pr-3 font-medium">Loại</th>
+              <th scope="col" className="py-2 pr-3 font-medium">Điểm</th>
+              <th scope="col" className="py-2 pr-3 font-medium">Động lượng 20P</th>
+              <th scope="col" className="py-2 pr-3 font-medium">vs SMA20</th>
+              <th scope="col" className="py-2 pr-3 font-medium">KL ×TB</th>
+              <th scope="col" className="py-2 font-medium">Lý do</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {screening.candidates.map((candidate) => (
+              <tr key={candidate.ticker} className="align-top">
+                <td className="py-2 pr-3 font-mono font-medium">
+                  {candidate.ticker}
+                </td>
+                <td className="py-2 pr-3">
+                  <Badge variant={candidate.asset_type === "crypto" ? "default" : "secondary"}>
+                    {candidate.asset_type === "crypto" ? "Crypto" : "Cổ phiếu"}
+                  </Badge>
+                </td>
+                <td className="py-2 pr-3 tabular-nums">
+                  {candidate.score.toFixed(1)}
+                </td>
+                <td className="py-2 pr-3 tabular-nums">
+                  {candidate.momentum_pct >= 0 ? "+" : ""}
+                  {candidate.momentum_pct.toFixed(1)}%
+                </td>
+                <td className="py-2 pr-3 tabular-nums">
+                  {candidate.trend_pct >= 0 ? "+" : ""}
+                  {candidate.trend_pct.toFixed(1)}%
+                </td>
+                <td className="py-2 pr-3 tabular-nums">
+                  ×{candidate.volume_ratio.toFixed(1)}
+                </td>
+                <td className="py-2 text-muted-foreground">
+                  {candidate.reasons.length > 0
+                    ? candidate.reasons.join(" · ")
+                    : "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }

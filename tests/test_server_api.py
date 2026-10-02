@@ -1001,6 +1001,72 @@ def test_daily_and_runs_share_one_worker_lock(client):
     assert job_while_busy.json()["error"]["details"]["job_id"] == "d_active"
 
 
+def test_daily_auto_mock_screens_then_replays_pipeline(client, tmp_path):
+    """Auto mode (§5 rev 4): mock screens deterministically, then the pipeline
+    runs on the screened candidates — one click, no watchlist, no network."""
+    set_config({"results_dir": str(tmp_path / "results"),
+                "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
+
+    created = client.post("/api/daily", json={"auto": True, "mode": "mock", "top_n": 3})
+    assert created.status_code == 202
+    assert created.json()["tickers"] == []  # decided by the screen inside the worker
+
+    job = _await_job(client, created.json()["job_id"])
+    assert job["status"] == "completed"
+    screening = job["screening"]
+    assert screening["mock"] is True
+    assert screening["universe_count"] == 3
+    tickers = [candidate["ticker"] for candidate in screening["candidates"]]
+    assert tickers == job["tickers"] == ["BTC-USD", "ETH-USD", "NVDA"]
+
+    # the pipeline ran on the screened candidates in rank order, stock advisory
+    assert [result["asset_type"] for result in job["results"]] == ["crypto", "crypto", "stock"]
+    btc, _eth, nvda = job["results"]
+    assert btc["signal"] == "Hold"  # synthetic fixture, no state log → Hold
+    assert nvda["asset_type"] == "stock"
+    assert nvda["plan"] is None
+    assert nvda["approval_id"] is None
+    assert "advisory only" in nvda["reason"]
+    assert client.get("/api/approvals").json()["pending_count"] == 0
+
+
+def test_daily_auto_validates_body_and_never_takes_tickers(client):
+    set_config({"results_dir": "results", "exec_log_path": "engine-audit.jsonl"})
+    for bad_body in (
+        {"auto": "yes"},          # not a boolean
+        {"auto": True, "top_n": 0},
+        {"auto": True, "top_n": 21},
+        {"auto": True, "top_n": "3"},
+        {"auto": True, "mode": "mock", "tickers": ["BTC-USD"]},  # screen picks, not you
+    ):
+        response = client.post("/api/daily", json=bad_body)
+        assert response.status_code == 400, bad_body
+        assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_daily_auto_off_set_crypto_is_advisory(client, tmp_path, monkeypatch):
+    """A crypto-universe ticker outside the closed executable set (QNT-USD)
+    keeps the crypto analysts but cannot plan: its result is advisory, never a
+    bridge ValueError."""
+    set_config({"results_dir": str(tmp_path / "results"),
+                "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
+    monkeypatch.setattr(daily_mod, "MOCK_AUTO_CANDIDATES", (
+        {"ticker": "QNT-USD", "asset_type": "crypto", "score": 3.0,
+         "last_close": 294.5, "momentum_pct": 12.0, "trend_pct": 4.0,
+         "volume_ratio": 1.1, "reasons": ["+12.0% trong 20 phiên"]},
+    ))
+
+    created = client.post("/api/daily", json={"auto": True, "mode": "mock"})
+    assert created.status_code == 202
+    job = _await_job(client, created.json()["job_id"])
+    (result,) = job["results"]
+    assert result["asset_type"] == "crypto"
+    assert result["plan"] is None
+    assert result["approval_id"] is None
+    assert "outside the executable crypto set" in result["reason"]
+    assert client.get("/api/approvals").json()["pending_count"] == 0
+
+
 def test_daily_mock_plan_cannot_be_approved(client, tmp_path):
     _state_log(tmp_path, rating="Buy")
     set_config({"results_dir": str(tmp_path / "results"),

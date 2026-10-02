@@ -43,6 +43,8 @@ export interface DailyResultItem {
   error: string | null;
   /** Chỉ job mode:"mock" — "replay:<path>" hoặc "synthetic". */
   mock_source?: string;
+  /** "crypto" | "stock" — stock chỉ advisory, không sinh lệnh (rev 4). */
+  asset_type?: string;
 }
 
 export type DailyJobStatus = "queued" | "running" | "completed" | "failed";
@@ -57,7 +59,7 @@ export interface DailyJobStart {
   detail_url: string;
 }
 
-/** Response 200 của GET /api/daily/{job_id} (contract §5 rev 3). */
+/** Response 200 của GET /api/daily/{job_id} (contract §5 rev 3+4). */
 export interface DailyJobStatusResponse {
   generated_at: string;
   job_id: string;
@@ -66,6 +68,9 @@ export interface DailyJobStatusResponse {
   created_at: string;
   finished_at: string | null;
   tickers: string[];
+  /** Job auto (rev 4): sàng lọc thị trường gắn trên payload. */
+  asset_types?: Record<string, string>;
+  screening?: ScreeningInfo | null;
   results: DailyResultItem[];
 }
 
@@ -74,3 +79,25 @@ export type ApiErrorInfo = {
   code: string;
   message: string;
 };
+
+/** Một ứng viên sau khi server sàng lọc thị trường (auto-scan, contract §5 rev 4). */
+export interface ScreeningCandidate {
+  ticker: string;
+  asset_type: "crypto" | "stock";
+  score: number;
+  last_close: number;
+  momentum_pct: number;
+  trend_pct: number;
+  volume_ratio: number;
+  reasons: string[];
+}
+
+/** Khối screening gắn trên job mode auto (contract §5 rev 4). */
+export interface ScreeningInfo {
+  universe_count: number;
+  universe_crypto: number;
+  universe_stock: number;
+  candidates: ScreeningCandidate[];
+  /** Chỉ job mock — sàng cố định, không đụng network. */
+  mock?: boolean;
+}

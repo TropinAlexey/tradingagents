@@ -1,6 +1,6 @@
 # Web UI API Contract (`docs/ui-api-contract.md`)
 
-updated: 2026-10-01 (rev 3: §4 approve fail-closed → rebuild plan + `execute_order` + audit hai tầng, bỏ policy dry-fill-on-gate-closed; §5 daily job có `mode: live|mock` — mock tái dùng cơ chế của `runs.py`, enqueue per-coin, không bao giờ tự thực thi; §6 mới GET /api/portfolio; approval item + `daily_job_id`/`expires_at`; endpoint 17→18 · rev 3.1: approve pipeline 4 bước ĐÃ IMPLEMENT — dead-end claim-only xoá, refusals 409-mock/409-rebuild trước claim nên item còn pending/reject được; item + `executed`/`mode`/`order_id`) · status: design + implementation song song (đã implement: §1–§4, §7–§9 — approve chạy đủ pipeline execute từ rev 3.1; thiết kế: §5, §6)
+updated: 2026-10-01 (rev 3: §4 approve fail-closed → rebuild plan + `execute_order` + audit hai tầng, bỏ policy dry-fill-on-gate-closed; §5 daily job có `mode: live|mock` — mock tái dùng cơ chế của `runs.py`, enqueue per-coin, không bao giờ tự thực thi; §6 mới GET /api/portfolio; approval item + `daily_job_id`/`expires_at`; endpoint 17→18 · rev 3.1: approve pipeline 4 bước ĐÃ IMPLEMENT — dead-end claim-only xoá, refusals 409-mock/409-rebuild trước claim nên item còn pending/reject được; item + `executed`/`mode`/`order_id` · rev 4: §5 POST /api/daily nhận `auto: true` + `top_n` — quét tự động 1-click, server tự sàng universe crypto (ccxt public, top theo khối lượng) + cổ phiếu Mỹ (yfinance.screen, fallback danh sách tĩnh) qua `tradingagents/dataflows/screening.py`, payload job thêm `asset_types` + `screening`; ứng viên stock chỉ advisory — có tín hiệu, không sinh lệnh; ĐÃ IMPLEMENT cả hai phía) · status: design + implementation song song (đã implement: §1–§4, §7–§9 — approve chạy đủ pipeline execute từ rev 3.1; thiết kế: §5 rev 4 đã implement auto mode; §6)
 audience: frontend + backend implementer của control-panel UI cho TradingAgents
 
 Hợp đồng này bọc engine hiện có **mà không sửa mã lõi `tradingagents/`**. Mọi mapping
@@ -486,7 +486,19 @@ Request bắt buộc `Content-Type: application/json` (quy tắc CSRF §0); body
 { "tickers": ["BTC-USD", "SOL-USD"], "mode": "live" }
 ```
 
+hoặc quét tự động (rev 4) — **một nút bấm, server tự tìm mã**:
+
+```json
+{ "auto": true, "top_n": 5, "mode": "live" }
+```
+
 - `tickers` bỏ qua/null → dùng `exec_watchlist` hiện hành (`daily.py:127-128`); normalize tại biên giới (strip, drop rỗng, dedupe giữ thứ tự — như `_normalize_watchlist`, `daily.py:95-111`); ticker rỗng sau strip → 400.
+- `auto` (rev 4, đã implement): `true` → **bỏ qua watchlist**. Worker chạy bước sàng lọc rẻ trước (`server/daily.py:_screen_candidates` → `tradingagents/dataflows/screening.py`):
+  - **Universe crypto**: ccxt public (`fetch_tickers` trên `exec_exchange_id`, mặc định binance — không cần API key), top theo `quoteVolume` 24h, lọc stablecoin (USDC/USD1/FDUSD/…), floor 5M USDT; map về dạng pipeline `BASE-USD`.
+  - **Universe cổ phiếu**: `yfinance.screen` (`EquityQuery region=us + intradaymarketcap>10B`, top theo vốn hóa); screener lỗi → fallback danh sách tĩnh lớn-cap (~38 mã liquid) nên outage không chặn auto-scan.
+  - **Chấm điểm** (`screen_universe`): động lượng 20 phiên, giá vs SMA20, khối lượng phiên cuối / trung bình 20 phiên — mỗi trạm cộng điểm có trần, kèm `reasons` (tiếng Việt) hiển thị thẳng UI. Chỉ dùng `load_ohlcv` (có cache) — **không LLM, không tốn quota**.
+  - Top `top_n` (mặc định 5, cap 20) đi tiếp vào pipeline LLM; kết quả sàng gắn lên job dưới `screening`.
+  - `mode:"mock"` → sàng cố định fixture (BTC-USD/ETH-USD/NVDA) **không đụng network** (hằng số `MOCK_AUTO_CANDIDATES`).
 - `mode` (rev 3): `"live"` (mặc định — phân tích LLM thật) | `"mock"` (tái dùng cơ chế mock của `runs.py` — **không cần LLM key, không network**).
 - Chạy trong cùng worker thread duy nhất với `POST /api/runs` (lock `set_config` — §3); worker bận → `409 conflict`. Mock vẫn chiếm lock (đơn giản hoá; job không quá vài giây).
 
@@ -494,10 +506,11 @@ Vòng lặp worker — mỗi coin, coin fail không dừng watchlist (`daily.py:
 
 1. **Phân tích**:
    - `mode:"mock"` — tái dùng đúng machinery mock của `server/runs.py`: `_find_state_log` → `full_states_log_<date>.json` của ticker (mới nhất nếu thiếu đúng ngày — `runs.py:232-247`), không có → `_synthetic_state` (`runs.py:203-229`); signal = `parse_rating(state["final_trade_decision"])` (`runs.py:270`). Không dựng graph, không gọi LLM, không vendor call.
-   - `mode:"live"` — như `daily.py:147-164`: `TradingAgentsGraph(config, selected_analysts=("market","social","news"))` + `graph.propagate(coin, today, asset_type="crypto")`, tối đa 3 lần thử với backoff 20s/40s, mỗi lần dựng graph mới (checkpoint state hỏng giữa pipeline không dính vào lần sau).
+   - `mode:"live"` — như `daily.py:147-164`: `TradingAgentsGraph(config, selected_analysts=("market","social","news"))` + `graph.propagate(coin, today, asset_type=…)`, tối đa 3 lần thử với backoff 20s/40s, mỗi lần dựng graph mới (checkpoint state hỏng giữa pipeline không dính vào lần sau). rev 4: `asset_type` theo ứng viên (`crypto` giữ nguyên; `stock` thêm analyst `fundamentals` như `runs.py:_analysts_for`).
 2. **Plan**: `bridge.plan_order(coin, signal, portfolio)` (`bridge.py:192-263`) — tự audit plan line phase=`plan` (`bridge.py:255-262`) và tự chạy RiskGuard plan-time. `portfolio` = `bridge.sync_portfolio()`. Venue: mock → **stub venue inject** qua `exchange_factory` (`bridge.py:126-129, 137-145` — cùng seam test inject của engine): `fetch_ticker`/`fetch_balance`/`load_markets` trả giá/balance fixture cố định ⇒ không network; live → venue thật (lệch `exec_sandbox`/`exec_exchange_id` theo config).
+   - rev 4: **ứng viên stock chỉ advisory** — `plan_order` của bridge chỉ nhận crypto (`symbol_for` raise với mã khác, `bridge.py:174-186`), nên kết quả stock ghi `asset_type: "stock"`, `plan: null`, `reason: "advisory only — …"`; tín hiệu vẫn là output của pipeline.
 3. **Plan actionable → ENQUEUE, không execute** (dù `exec_auto_confirm` có arm hay không — invariant dưới): plan có `side != null` → `approvals.enqueue(plan_dict)` (§4) + `bridge.audit_plan(plan, action="awaiting_approval", reason="UI daily job: plan awaits approval")` (đúng seam `daily.py:219-222`) → `results[]` ghi `approval_id`. Plan không tradeable (`side is None` — Hold/REVIEW/sizing refusal `sizing.py:104-143`, hoặc risk rejection `bridge.py:240-254`) → chỉ ghi `reason = plan.reason`, `approval_id: null`.
-4. Audit vòng lặp: server trail ghi `daily_job_created` / `daily_job_completed` (kèm `job_id, mode, tickers`).
+4. Audit vòng lặp: server trail ghi `daily_job_created` / `daily_job_completed` (kèm `job_id, mode, tickers`; rev 4 thêm `auto, top_n`).
 
 Invariants của daily job:
 
@@ -518,7 +531,7 @@ Response 202:
 }
 ```
 
-Errors: 400 `validation_error` (ticker rỗng sau strip, `mode` lạ), 409 `conflict` (worker bận, kèm `details.run_id` hoặc `details.job_id` đang chạy), 415/403 CSRF (§0).
+Errors: 400 `validation_error` (ticker rỗng sau strip, `mode` lạ; rev 4: `auto` không phải bool, `top_n` ngoài 1–20, `tickers` đi cùng `auto`, `top_n` không nguyên), 409 `conflict` (worker bận, kèm `details.run_id` hoặc `details.job_id` đang chạy), 415/403 CSRF (§0).
 
 ### GET /api/daily/{job_id}
 
@@ -533,9 +546,12 @@ Job state in-memory của server (như `RunState` — `runs.py:39-61`), `results
   "created_at": "2026-09-30T09:00:01Z",
   "finished_at": null,
   "tickers": ["BTC-USD", "SOL-USD"],
+  "asset_types": {},
+  "screening": null,
   "results": [
     {
       "ticker": "BTC-USD",
+      "asset_type": "crypto",
       "signal": "Buy",
       "reason": "awaiting approval",
       "plan": {
@@ -548,6 +564,7 @@ Job state in-memory của server (như `RunState` — `runs.py:39-61`), `results
     },
     {
       "ticker": "SOL-USD",
+      "asset_type": "crypto",
       "signal": null,
       "reason": "PermissionError: risk guard halted trading: 3 consecutive losing trades reached the limit 3; trading halted for today",
       "plan": null,
@@ -558,8 +575,9 @@ Job state in-memory của server (như `RunState` — `runs.py:39-61`), `results
 }
 ```
 
-- Mỗi coin: `signal` (5-tier hoặc `REVIEW` — `trading_graph.py:167-171`), `reason` (lý do không trade / `"awaiting approval"` / `"<ExceptionType>: <message>"` khi coin fail), `plan` = **chi tiết đủ cho M4** (`side, quantity, price_est, cost, ccxt_symbol, market, leverage, mode_at_plan, plan_reason` — đúng field `enqueue` nhận, §4), `approval_id` tham chiếu `GET /api/approvals` (null khi plan không tradeable), `error` (lỗi hệ thống khác reason nghiệp vụ).
+- Mỗi coin: `signal` (5-tier hoặc `REVIEW` — `trading_graph.py:167-171`), `reason` (lý do không trade / `"awaiting approval"` / `"<ExceptionType>: <message>"` khi coin fail), `plan` = **chi tiết đủ cho M4** (`side, quantity, price_est, cost, ccxt_symbol, market, leverage, mode_at_plan, plan_reason` — đúng field `enqueue` nhận, §4), `approval_id` tham chiếu `GET /api/approvals` (null khi plan không tradeable), `error` (lỗi hệ thống khác reason nghiệp vụ). rev 4 thêm `asset_type` per coin (`"crypto"` mặc định; job cũ trước rev 4 không có field này — frontend đọc `asset_types`/`screening` null an toàn).
 - Job `mode:"mock"`: thêm `mock_source` per coin — `"replay:<path>"` (đã replay state log thật) hoặc `"synthetic"` (fixture nội tuyến); `signal` đến từ file replay, ví dụ `"Hold"` → không sinh plan; `plan.price_est` là giá fixture của stub venue.
+- Job `auto` (rev 4): `tickers` là danh sách ứng viên post-sàng; `screening` non-null với shape `{universe_count, universe_crypto, universe_stock, candidates[], mock?}`; `candidates[]` mỗi phần tử `{ticker, asset_type, score, last_close, momentum_pct, trend_pct, volume_ratio, reasons[]}`. Bước sàng xong trước vòng lặp coin nên UI thấy bảng ứng viên ngay khi poll lần đầu sau khi worker start.
 - `status`: `queued | running | completed | failed` (`failed` chỉ khi worker văng ngoài vòng lặp coin; coin fail riêng chỉ là `reason` trong `results[]`). Poll mỗi 2–5s khi `queued/running`; ngừng poll khi terminal. Đã có `generated_at` để đánh dấu stale.
 - Coin fail giữa pipeline KHÔNG dừng vòng lặp (`daily.py:170-173`); coin skip propagate sau 3 lần thử cũng ghi `reason` như vậy (`daily.py:155-164`).
 
