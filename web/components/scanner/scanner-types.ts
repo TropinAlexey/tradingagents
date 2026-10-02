@@ -28,6 +28,9 @@ export interface DailyPlan {
   leverage: number;
   mode_at_plan: string;
   plan_reason: string | null;
+  /** Giá cắt lỗ/chốt lời đính kèm (ATR-derived, rev 5) — null khi ATR thiếu. */
+  stop_loss?: number | null;
+  take_profit?: number | null;
 }
 
 export interface DailyResultItem {

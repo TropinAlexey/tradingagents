@@ -376,3 +376,53 @@ def screen_universe(
                 candidates.append(candidate)
     candidates.sort(key=lambda c: (-c.score, c.ticker))
     return [candidate.as_dict() for candidate in candidates[:top_n]]
+
+
+# ATR multiples for the protective bracket: a 1.5x-ATR stop sits outside the
+# day's normal noise, a 2.0x-ATR target keeps the reward:risk at 1.33:1 —
+# the entry quality (breakout + volume) is what has to carry the expectancy.
+_STOP_ATR_MULT = 1.5
+_TAKE_PROFIT_ATR_MULT = 2.0
+# Sanity clamps in percent of entry: below the floor the stop is inside noise,
+# above the ceiling a single loss breaches the risk caps anyway.
+_STOP_MIN_PCT, _STOP_MAX_PCT = 1.0, 20.0
+_TP_MIN_PCT, _TP_MAX_PCT = 1.5, 30.0
+
+
+def atr_targets(
+    ticker: str, curr_date: str, asset_type: str = "crypto"
+) -> tuple[float | None, float | None]:
+    """(stop_loss, take_profit) for a LONG at the last close, ATR-derived.
+
+    Both are exchange-order prices computed from the cached OHLCV series, so
+    the daily worker can attach a protective bracket to every entry plan
+    without a second market read. ``(None, None)`` when ATR is unavailable —
+    the caller then enters without a bracket rather than inventing distances.
+    """
+    try:
+        data = load_ohlcv(ticker, curr_date, fill_gaps=True)
+    except (VendorError, OSError, ValueError, KeyError) as exc:
+        logger.info("atr_targets %s skipped: %s", ticker, exc)
+        return None, None
+    close = data["Close"].dropna()
+    if close.empty:
+        return None, None
+    last = float(close.iloc[-1])
+    if last <= 0:
+        return None, None
+    try:
+        from stockstats import wrap
+
+        df = wrap(data[["Date", "Open", "High", "Low", "Close", "Volume"]])
+        atr = float(df["atr"].iloc[-1])
+    except (ImportError, KeyError, IndexError, TypeError, ValueError) as exc:
+        logger.info("atr_targets %s: ATR unavailable: %s", ticker, exc)
+        return None, None
+    if atr != atr or atr <= 0:  # NaN guard
+        return None, None
+    atr_pct = atr / last * 100.0
+    stop_dist = min(max(atr_pct * _STOP_ATR_MULT, _STOP_MIN_PCT), _STOP_MAX_PCT)
+    tp_dist = min(max(atr_pct * _TAKE_PROFIT_ATR_MULT, _TP_MIN_PCT), _TP_MAX_PCT)
+    return round(last * (1.0 - stop_dist / 100.0), 8), round(
+        last * (1.0 + tp_dist / 100.0), 8
+    )

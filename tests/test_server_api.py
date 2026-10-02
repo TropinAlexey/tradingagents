@@ -89,13 +89,24 @@ def _today() -> str:
 
 @pytest.fixture(autouse=True)
 def _server_state(tmp_path, monkeypatch):
-    """Point all server state at tmp and start every test with an empty registry."""
+    """Point all server state at tmp and start every test with an empty registry.
+
+    ``watchlist._save_state`` deliberately syncs ``DEFAULT_CONFIG
+    ["exec_watchlist"]`` (process-global, so the in-process daily runner sees
+    the same list), which would leak into later test files
+    (test_execution_daily reads the default) — snapshot and restore it.
+    """
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    saved_watchlist = DEFAULT_CONFIG.get("exec_watchlist")
     monkeypatch.setattr(server_paths, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
     monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
     monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
     monkeypatch.setattr(runs_mod, "_runs", {})
     monkeypatch.setattr(daily_mod, "_jobs", {})
+    yield
+    DEFAULT_CONFIG["exec_watchlist"] = saved_watchlist
 
 
 @pytest.fixture()
@@ -1065,6 +1076,33 @@ def test_daily_auto_off_set_crypto_is_advisory(client, tmp_path, monkeypatch):
     assert result["approval_id"] is None
     assert "outside the executable crypto set" in result["reason"]
     assert client.get("/api/approvals").json()["pending_count"] == 0
+
+
+def test_daily_mock_buy_plan_carries_bracket_and_approval_keeps_it(client, tmp_path):
+    """A Buy plan gets protective exits attached (mock: fixed demo distances),
+    and the approval item + rebuilt plan both carry them so approve → execute
+    can place the exchange-side bracket."""
+    _state_log(tmp_path, rating="Buy")
+    set_config({"results_dir": str(tmp_path / "results"),
+                "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
+
+    created = client.post("/api/daily", json={"tickers": ["BTC-USD"], "mode": "mock"})
+    job = _await_job(client, created.json()["job_id"])
+    (result,) = job["results"]
+    plan = result["plan"]
+    assert plan["side"] == "buy"
+    price = plan["price_est"]
+    assert plan["stop_loss"] == pytest.approx(price * 0.96)
+    assert plan["take_profit"] == pytest.approx(price * 1.08)
+
+    items = client.get("/api/approvals").json()["items"]
+    (item,) = items
+    assert item["stop_loss"] == pytest.approx(price * 0.96)
+    assert item["take_profit"] == pytest.approx(price * 1.08)
+
+    rebuilt = approvals_mod._rebuild_plan(item)
+    assert rebuilt.stop_loss == pytest.approx(price * 0.96)
+    assert rebuilt.take_profit == pytest.approx(price * 1.08)
 
 
 def test_daily_mock_plan_cannot_be_approved(client, tmp_path):

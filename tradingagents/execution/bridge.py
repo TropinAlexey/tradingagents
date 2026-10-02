@@ -357,7 +357,9 @@ class ExchangeBridge:
 
     def _execute_dry(self, order: PlannedOrder, confirm: bool) -> None:
         # Simulated fill: no exchange call of any kind, so no write endpoint
-        # can be reached and no confirm is needed (FR4).
+        # can be reached and no confirm is needed (FR4). Planned brackets
+        # ride the audit line via stop_loss/take_profit — the dry fill is the
+        # rehearsal for the live bracket placement.
         self._audit(
             action=order.side or "no_order",
             order=order,
@@ -467,7 +469,70 @@ class ExchangeBridge:
                 f"order {order_id!r} WAS placed on {order.ccxt_symbol} but writing "
                 f"the audit log failed: {exc}"
             ) from exc
+        if order.side == "buy" and (order.stop_loss is not None or order.take_profit is not None):
+            self._place_bracket(order, confirm)
         return order_id
+
+    def _place_bracket(self, order: PlannedOrder, confirm: bool) -> None:
+        """Attach exchange-side protective exits after an entry fill.
+
+        The bracket lives on the venue (ccxt unified stopLoss/takeProfit
+        params → OCO on binance spot), so the stop survives this process
+        dying — the exchange enforces it, not us. A bracket that fails to
+        place AFTER the entry filled must never discard the fill or look
+        like a failed order (safety #4): it is audited loudly as
+        ``bracket_failed`` and the position stays, protected only by the
+        next daily loop's exit signals.
+        """
+        exchange = self._exchange_or_raise()
+        params: dict[str, Any] = {}
+        if order.stop_loss is not None:
+            params["stopLoss"] = {"stopPrice": order.stop_loss}
+        if order.take_profit is not None:
+            params["takeProfit"] = {"stopPrice": order.take_profit}
+        import ccxt
+
+        try:
+            response = exchange.create_order(
+                order.ccxt_symbol, "market", "sell", order.quantity,
+                None, params,
+            )
+        except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
+            self._audit(
+                action="bracket_failed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                reason=f"exchange error placing protective exits: {exc}",
+                phase="execute",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — the entry already filled
+            self._audit(
+                action="bracket_failed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                reason=f"unexpected error placing protective exits: {exc!r}",
+                phase="execute",
+            )
+            return
+        bracket_id = response.get("id") if isinstance(response, dict) else None
+        try:
+            self._audit(
+                action="bracket_placed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                order_id=bracket_id,
+                reason="exchange-side stopLoss/takeProfit attached after entry fill",
+                phase="execute",
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"bracket {bracket_id!r} WAS placed on {order.ccxt_symbol} but writing "
+                f"the audit log failed: {exc}"
+            ) from exc
 
     def _effective_mode(self) -> str:
         # ``is True`` on purpose: the config gate only opens on a real boolean
@@ -597,6 +662,10 @@ class ExchangeBridge:
             "market": getattr(order, "market", "spot"),
             "leverage": getattr(order, "leverage", 1.0),
         }
+        if getattr(order, "stop_loss", None) is not None:
+            event["stop_loss"] = order.stop_loss
+        if getattr(order, "take_profit", None) is not None:
+            event["take_profit"] = order.take_profit
         if qty_precision is not None:
             event["qty_precision"] = qty_precision
         if reason is not None:

@@ -85,6 +85,16 @@ function ResultRow({ item }: { item: DailyResultItem }) {
           <span className="whitespace-nowrap">
             {sideLabel(plan.side)} · {formatQty(plan.quantity, item.ticker)} @{" "}
             {formatUsd(plan.price_est)}
+            {plan.stop_loss != null ? (
+              <span className="ml-2 text-xs text-destructive">
+                SL {formatUsd(plan.stop_loss)}
+              </span>
+            ) : null}
+            {plan.take_profit != null ? (
+              <span className="ml-2 text-xs text-emerald-700 dark:text-emerald-400">
+                TP {formatUsd(plan.take_profit)}
+              </span>
+            ) : null}
           </span>
         ) : (
           "—"

@@ -126,6 +126,8 @@ def enqueue(plan: dict) -> dict:
             "leverage": plan.get("leverage", 1.0),
             "mode_at_plan": plan.get("mode_at_plan", "dry"),
             "plan_reason": plan.get("plan_reason"),
+            "stop_loss": plan.get("stop_loss"),
+            "take_profit": plan.get("take_profit"),
             "mock": bool(plan.get("mock", False)),
             "status": "pending",
             "resolved_at": None,
@@ -179,6 +181,8 @@ def _rebuild_plan(item: dict) -> PlannedOrder:
         reason=None,
         market=item.get("market") or "spot",
         leverage=float(item.get("leverage") or 1.0),
+        stop_loss=item.get("stop_loss"),
+        take_profit=item.get("take_profit"),
     )
 
 

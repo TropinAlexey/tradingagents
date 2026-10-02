@@ -230,6 +230,25 @@ def _analyze(job: DailyJobState, coin: str, config: dict) -> tuple[str, str | No
     raise RuntimeError("propagate exhausted its retries without a signal")  # pragma: no cover
 
 
+def _attach_bracket(job: DailyJobState, plan, coin: str):
+    """ATR-derived protective exits on an entry plan (the operator never
+    sizes a stop by hand). Live plans read the cached OHLCV series; mock
+    plans carry fixed demo distances. A missing ATR leaves the plan
+    bracket-less rather than inventing numbers — the audit shows why."""
+    if job.mode == "mock":
+        price = plan.estimated_price or MOCK_PRICE
+        return plan.model_copy(update={
+            "stop_loss": round(price * 0.96, 8),
+            "take_profit": round(price * 1.08, 8),
+        })
+    from tradingagents.dataflows.screening import atr_targets
+
+    stop, take = atr_targets(coin, _today_iso(), "crypto")
+    if stop is None or take is None:
+        return plan
+    return plan.model_copy(update={"stop_loss": stop, "take_profit": take})
+
+
 def _plan_item(job: DailyJobState, plan) -> dict:
     """The enqueue payload (contract §4): everything the approval gate needs."""
     return {
@@ -246,6 +265,8 @@ def _plan_item(job: DailyJobState, plan) -> dict:
         "leverage": plan.leverage,
         "mode_at_plan": plan.mode,
         "plan_reason": plan.reason,
+        "stop_loss": plan.stop_loss,
+        "take_profit": plan.take_profit,
         "mock": job.mode == "mock",
     }
 
@@ -261,6 +282,8 @@ def _plan_detail(plan) -> dict:
         "leverage": plan.leverage,
         "mode_at_plan": plan.mode,
         "plan_reason": plan.reason,
+        "stop_loss": plan.stop_loss,
+        "take_profit": plan.take_profit,
     }
 
 
@@ -301,6 +324,8 @@ def _process_coin(job: DailyJobState, bridge, coin: str, config: dict) -> dict:
             return result
         portfolio = bridge.sync_portfolio()
         plan = bridge.plan_order(coin, signal, portfolio=portfolio)
+        if plan.side == "buy":
+            plan = _attach_bracket(job, plan, coin)
         if plan.side is None:
             result["reason"] = plan.reason  # Hold/REVIEW, sizing refusal or risk rejection
             return result

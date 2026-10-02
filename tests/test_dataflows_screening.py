@@ -239,3 +239,28 @@ def test_stock_universe_falls_back_when_screener_fails(monkeypatch):
     monkeypatch.setattr(yfinance, "screen", boom, raising=False)
     universe = screening.stock_universe({}, top_n=5)
     assert universe == list(screening._STOCK_UNIVERSE_FALLBACK[:5])
+
+
+def test_atr_targets_derive_protective_exits_from_atr(monkeypatch):
+    """The bracket prices bracket the last close: stop below, target above,
+    both derived from the ATR the fixtures imply (High/Low = ±1%)."""
+    closes = [100.0 + (i % 5) * 2 for i in range(60)]  # wobble, no NaN ATR
+    monkeypatch.setattr(
+        screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes)
+    )
+    stop, take = screening.atr_targets("BTC-USD", "2026-10-01", "crypto")
+    assert stop is not None and take is not None
+    last = closes[-1]
+    assert stop < last < take
+    sl_dist = (last - stop) / last * 100
+    tp_dist = (take - last) / last * 100
+    assert screening._STOP_MIN_PCT <= sl_dist <= screening._STOP_MAX_PCT
+    assert screening._TP_MIN_PCT <= tp_dist <= screening._TP_MAX_PCT
+
+
+def test_atr_targets_vendor_error_returns_none_pair(monkeypatch):
+    def boom(ticker, date, fill_gaps):
+        raise NoMarketDataError(ticker, ticker, "no rows")
+
+    monkeypatch.setattr(screening, "load_ohlcv", boom)
+    assert screening.atr_targets("BTC-USD", "2026-10-01") == (None, None)

@@ -43,7 +43,8 @@ class FakeExchange:
     """Offline stand-in for ccxt.binance that records every call."""
 
     def __init__(self, *, api_key="test-key", secret="test-secret", price=50_000.0,
-                 min_cost=10.0, balance=None, create_order_error=None):
+                 min_cost=10.0, balance=None, create_order_error=None,
+                 bracket_error=None):
         self.apiKey = api_key
         self.secret = secret
         self.price = price
@@ -53,8 +54,10 @@ class FakeExchange:
             "free": {"BTC": 0.5, "ETH": 2.0, "USDT": 1_000.0},
         }
         self.create_order_error = create_order_error
+        self.bracket_error = bracket_error  # fails only AFTER one entry fill
         self.calls = []
         self._markets_loaded = False
+        self._filled = 0
 
     def fetch_ticker(self, symbol):
         self.calls.append(("fetch_ticker", symbol))
@@ -73,9 +76,12 @@ class FakeExchange:
         return f"{scaled:.6f}"
 
     def create_order(self, symbol, order_type, side, amount, price=None, params=None):
-        self.calls.append(("create_order", symbol, order_type, side, amount))
+        self.calls.append(("create_order", symbol, order_type, side, amount, params))
         if self.create_order_error is not None:
             raise self.create_order_error
+        if self.bracket_error is not None and self._filled >= 1:
+            raise self.bracket_error
+        self._filled += 1
         return {"id": "order-123"}
 
     def fetch_balance(self):
@@ -311,6 +317,49 @@ def test_dry_run_needs_no_confirm_and_touches_no_endpoint(tmp_path, monkeypatch)
     assert event["order_id"] is None
 
 
+def test_dry_audit_line_carries_planned_bracket(tmp_path, monkeypatch):
+    """Planned protective exits ride the audit line so the dry fill rehearses
+    exactly what the live bracket placement will do."""
+    exchange = FakeExchange()
+    bridge = make_bridge(tmp_path, monkeypatch, factory=lambda: exchange)
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    order = order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 53_000.0})
+    bridge.execute_order(order)
+    event = read_audit(tmp_path)[-1]
+    assert event["stop_loss"] == 48_000.0
+    assert event["take_profit"] == 53_000.0
+
+
+def test_live_buy_fill_places_exchange_side_bracket(tmp_path, monkeypatch):
+    """After a live entry fill the protective exits are attached on the venue
+    via ccxt unified params — a second create_order call, audited."""
+    exchange = FakeExchange()
+    bridge = live_bridge(tmp_path, monkeypatch, exchange)
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    order = order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 53_000.0})
+    bridge.execute_order(order, confirm=True)
+    bracket_calls = [c for c in exchange.calls if c[0] == "create_order" and c[3] == "sell"]
+    assert len(bracket_calls) == 1
+    _name, _symbol, _type, _side, amount, params = bracket_calls[0]
+    assert params["stopLoss"]["stopPrice"] == 48_000.0
+    assert params["takeProfit"]["stopPrice"] == 53_000.0
+    actions = [e["action"] for e in read_audit(tmp_path)]
+    assert "bracket_placed" in actions
+
+
+def test_live_bracket_failure_keeps_the_fill(tmp_path, monkeypatch):
+    """Safety #4 variant: the entry FILLED, the bracket did not — the fill
+    must survive as a success and the failure must be audited loudly."""
+    exchange = FakeExchange(bracket_error=ccxt.ExchangeError("bracket refused"))
+    bridge = live_bridge(tmp_path, monkeypatch, exchange)
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    order = order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 53_000.0})
+    order_id = bridge.execute_order(order, confirm=True)  # must NOT raise
+    assert order_id is not None
+    actions = [e["action"] for e in read_audit(tmp_path)]
+    assert actions[-1] == "bracket_failed"
+
+
 def test_live_without_confirm_is_denied(tmp_path, monkeypatch):
     exchange = FakeExchange()
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
@@ -329,7 +378,7 @@ def test_live_with_confirm_places_market_order(tmp_path, monkeypatch):
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     order_id = bridge.execute_order(order, confirm=True)
     assert order_id == "order-123"
-    assert ("create_order", "BTC/USDT", "market", "buy", "0.005000") in exchange.calls
+    assert ("create_order", "BTC/USDT", "market", "buy", "0.005000", None) in exchange.calls
     kinds = [call[0] for call in exchange.calls]  # markets must load before precision
     assert kinds.index("load_markets") < kinds.index("amount_to_precision") < kinds.index("create_order")
     event = read_audit(tmp_path)[-1]
