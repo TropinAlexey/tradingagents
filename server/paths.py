@@ -14,6 +14,7 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 WATCHLIST_PATH = DATA_DIR / "watchlist.json"
 APPROVALS_PATH = DATA_DIR / "approvals.jsonl"
 SERVER_AUDIT_PATH = DATA_DIR / "audit.jsonl"
+AUTOLOOP_PATH = DATA_DIR / "autoloop.json"
 
 
 def ensure_data_dir() -> None:

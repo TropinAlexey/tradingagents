@@ -14,11 +14,23 @@ token (contract §0, §11.12).
 """
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request
 
-from server import approvals, audit, daily, health, history, portfolio, runs, settings, watchlist
+from server import (
+    approvals,
+    audit,
+    autoloop,
+    daily,
+    health,
+    history,
+    performance,
+    portfolio,
+    runs,
+    settings,
+    watchlist,
+)
 from server.contract import error_response, install_error_handlers
 
 # Origins allowed to drive state-changing requests: the server itself, the
@@ -38,6 +50,8 @@ _STATE_CHANGING_METHODS = {"POST", "PUT", "DELETE"}
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     watchlist.ensure_seeded()
+    with suppress(OSError):  # unreadable data dir must not keep the server down; the loop stays off
+        autoloop.ensure_started()
     yield
 
 
@@ -75,5 +89,7 @@ for _router in (
     audit.router,
     history.router,
     health.router,
+    performance.router,
+    autoloop.router,
 ):
     app.include_router(_router)
