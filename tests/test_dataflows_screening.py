@@ -264,3 +264,50 @@ def test_atr_targets_vendor_error_returns_none_pair(monkeypatch):
 
     monkeypatch.setattr(screening, "load_ohlcv", boom)
     assert screening.atr_targets("BTC-USD", "2026-10-01") == (None, None)
+
+
+def test_atr_targets_signed_long_matches_atr_targets(monkeypatch):
+    """The signed refactor must not change the long behavior: identical
+    distances, stop below entry, target above."""
+    closes = [100.0 + (i % 5) * 2 for i in range(60)]
+    monkeypatch.setattr(
+        screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes)
+    )
+    signed = screening.atr_targets_signed("BTC-USD", "2026-10-01", "long")
+    assert signed == screening.atr_targets("BTC-USD", "2026-10-01", "crypto")
+    stop, take = signed
+    last = closes[-1]
+    assert stop is not None and take is not None
+    assert stop < last < take
+
+
+def test_atr_targets_signed_short_mirrors_long(monkeypatch):
+    """A short entry is the mirror image: stop ABOVE entry, target BELOW, and
+    the distances match the long side exactly — same ATR, opposite side."""
+    closes = [100.0 + (i % 5) * 2 for i in range(60)]
+    monkeypatch.setattr(
+        screening, "load_ohlcv", lambda ticker, date, fill_gaps: _ohlcv_frame(closes)
+    )
+    last = closes[-1]
+    long_stop, long_take = screening.atr_targets_signed("BTC-USD", "2026-10-01", "long")
+    short_stop, short_take = screening.atr_targets_signed("BTC-USD", "2026-10-01", "short")
+    assert short_stop > last > short_take
+    assert short_stop == pytest.approx(last + (last - long_stop))
+    assert short_take == pytest.approx(last - (long_take - last))
+
+
+def test_atr_targets_signed_rejects_unknown_direction(monkeypatch):
+    monkeypatch.setattr(
+        screening, "load_ohlcv",
+        lambda ticker, date, fill_gaps: _ohlcv_frame([100.0] * 60),
+    )
+    with pytest.raises(ValueError, match="direction"):
+        screening.atr_targets_signed("BTC-USD", "2026-10-01", "sideways")
+
+
+def test_atr_targets_signed_vendor_error_returns_none_pair(monkeypatch):
+    def boom(ticker, date, fill_gaps):
+        raise NoMarketDataError(ticker, ticker, "no rows")
+
+    monkeypatch.setattr(screening, "load_ohlcv", boom)
+    assert screening.atr_targets_signed("BTC-USD", "2026-10-01", "short") == (None, None)

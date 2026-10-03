@@ -352,7 +352,81 @@ class DerivativesExecutor:
                 f"order {order_id!r} WAS placed on {order.ccxt_symbol} but writing "
                 f"the audit log failed: {exc}"
             ) from exc
+        if order.stop_loss is not None or order.take_profit is not None:
+            self._place_bracket(order, confirm)
         return order_id
+
+    def _place_bracket(self, order: PlannedOrder, confirm: bool) -> None:
+        """Attach exchange-side protective exits after a derivatives entry fill.
+
+        A ``sell`` is a short opener (FR-D1), so the closing side mirrors the
+        entry: long -> sell close, short -> buy close. Futures require
+        ``reduceOnly`` on the bracket (it may only reduce the entry
+        position -- without it a stop on a short would OPEN a fresh long).
+        The bracket lives on the venue (ccxt unified stopLoss/takeProfit
+        params), so the stop survives this process dying. A bracket that
+        fails AFTER the entry filled must never discard the fill or look
+        like a failed order (safety #4): it is audited loudly as
+        ``bracket_failed`` and the position stays, protected only by the
+        next daily loop's exit signals.
+        """
+        close_side = "sell" if order.side == "buy" else "buy"
+        exchange = self._bridge.client()
+        params: dict[str, Any] = {"reduceOnly": True}
+        if order.stop_loss is not None:
+            params["stopLoss"] = {"stopPrice": order.stop_loss}
+        if order.take_profit is not None:
+            params["takeProfit"] = {"stopPrice": order.take_profit}
+        import ccxt
+
+        try:
+            response = exchange.create_order(
+                order.ccxt_symbol, "market", close_side, order.quantity,
+                None, params,
+            )
+        except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
+            self._bridge.audit_plan(
+                order, action="bracket_failed",
+                reason=f"exchange error placing protective exits: {exc}",
+                confirmed=confirm, phase="execute",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — the entry already filled
+            self._bridge.audit_plan(
+                order, action="bracket_failed",
+                reason=f"unexpected error placing protective exits: {exc!r}",
+                confirmed=confirm, phase="execute",
+            )
+            return
+        bracket_id = response.get("id") if isinstance(response, dict) else None
+        try:
+            self._bridge.audit_plan(
+                order, action="bracket_placed",
+                confirmed=confirm, order_id=bracket_id,
+                reason="exchange-side stopLoss/takeProfit attached after derivatives fill",
+                phase="execute",
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"bracket {bracket_id!r} WAS placed on {order.ccxt_symbol} but writing "
+                f"the audit log failed: {exc}"
+            ) from exc
+
+    def effective_mode(self) -> str:
+        """The gate-decided mode right now: ``"live"`` or ``"dry"`` (FR5).
+
+        Delegated to the composed bridge so orchestrators (the daily runner,
+        the autoloop) see the same value the executor's own gate stack uses.
+        """
+        return self._bridge.effective_mode()
+
+    def audit_plan(self, order: PlannedOrder, **kwargs: Any) -> None:
+        """Public audit writer, shaped exactly like the bridge's (delegated).
+
+        ``_handle_plan`` waits for approval through this surface; keeping the
+        delegation here means callers never reach into ``executor._bridge``.
+        """
+        self._bridge.audit_plan(order, **kwargs)
 
     def _refuse(self, order: PlannedOrder, reason: str, *, phase: str) -> PermissionError:
         """Audit a gate refusal, then raise (fail-closed with a paper trail)."""

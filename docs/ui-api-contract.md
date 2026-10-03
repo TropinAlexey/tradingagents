@@ -1,6 +1,6 @@
 # Web UI API Contract (`docs/ui-api-contract.md`)
 
-updated: 2026-10-01 (rev 3: §4 approve fail-closed → rebuild plan + `execute_order` + audit hai tầng, bỏ policy dry-fill-on-gate-closed; §5 daily job có `mode: live|mock` — mock tái dùng cơ chế của `runs.py`, enqueue per-coin, không bao giờ tự thực thi; §6 mới GET /api/portfolio; approval item + `daily_job_id`/`expires_at`; endpoint 17→18 · rev 3.1: approve pipeline 4 bước ĐÃ IMPLEMENT — dead-end claim-only xoá, refusals 409-mock/409-rebuild trước claim nên item còn pending/reject được; item + `executed`/`mode`/`order_id` · rev 4: §5 POST /api/daily nhận `auto: true` + `top_n` — quét tự động 1-click, server tự sàng universe crypto (ccxt public, top theo khối lượng) + cổ phiếu Mỹ (yfinance.screen, fallback danh sách tĩnh) qua `tradingagents/dataflows/screening.py`, payload job thêm `asset_types` + `screening`; ứng viên stock chỉ advisory — có tín hiệu, không sinh lệnh; ĐÃ IMPLEMENT cả hai phía · rev 4.1: sàng lọc nâng cấp theo tiêu chí thực chiến đã research — universe 40/asset (crypto top khối lượng, cổ phiếu mạnh 52 tuần sort theo `fiftytwowkpercentchange`, cap floor $2B), metrics thêm RSI(14) + ATR(14)% (stockstats) + khoảng cách đỉnh 52 tuần + breakout 20 phiên kèm RVOL≥2 + dollar-volume floor 20 phiên (crypto $5M / stock $10M — gate loại bỏ, không chỉ trừ điểm) + RS vs benchmark (BTC-USD / ^GSPC); phạt đu đỉnh (RSI≥75, RVOL≥4, ATR>20%) · ĐÃ IMPLEMENT) · rev 5: §12 mới GET /api/performance — metrics trade replay từ engine audit log (fill phase=execute FIFO long-only per ticker; summary win/loss/expectancy, open_positions per lot mark qua price seam, brackets, recent_orders 50 dòng mới nhất; log thiếu/rỗng là empty state, không đọc được → 503 `audit_log_unreadable` như /api/audit); §13 mới autoloop + halt — GET/POST /api/autoloop (vòng lặp tự chạy theo interval 15–1440 phút, enable fail-closed 409 `gate_closed` qua cổng auto-confirm của engine: config literal + env flag), POST /api/autoloop/run-now (202), POST /api/halt + POST /api/halt/reset — kill switch không gate, line `halt`/`halt_reset` trong engine audit log mà RiskGuard của mọi process replay · ĐÃ IMPLEMENT cả hai phía · status: design + implementation song song (đã implement: §1–§4, §7–§9 — approve chạy đủ pipeline execute từ rev 3.1; thiết kế: §5 rev 4.1 đã implement auto mode; §6)
+updated: 2026-10-01 (rev 3: §4 approve fail-closed → rebuild plan + `execute_order` + audit hai tầng, bỏ policy dry-fill-on-gate-closed; §5 daily job có `mode: live|mock` — mock tái dùng cơ chế của `runs.py`, enqueue per-coin, không bao giờ tự thực thi; §6 mới GET /api/portfolio; approval item + `daily_job_id`/`expires_at`; endpoint 17→18 · rev 3.1: approve pipeline 4 bước ĐÃ IMPLEMENT — dead-end claim-only xoá, refusals 409-mock/409-rebuild trước claim nên item còn pending/reject được; item + `executed`/`mode`/`order_id` · rev 4: §5 POST /api/daily nhận `auto: true` + `top_n` — quét tự động 1-click, server tự sàng universe crypto (ccxt public, top theo khối lượng) + cổ phiếu Mỹ (yfinance.screen, fallback danh sách tĩnh) qua `tradingagents/dataflows/screening.py`, payload job thêm `asset_types` + `screening`; ứng viên stock chỉ advisory — có tín hiệu, không sinh lệnh; ĐÃ IMPLEMENT cả hai phía · rev 4.1: sàng lọc nâng cấp theo tiêu chí thực chiến đã research — universe 40/asset (crypto top khối lượng, cổ phiếu mạnh 52 tuần sort theo `fiftytwowkpercentchange`, cap floor $2B), metrics thêm RSI(14) + ATR(14)% (stockstats) + khoảng cách đỉnh 52 tuần + breakout 20 phiên kèm RVOL≥2 + dollar-volume floor 20 phiên (crypto $5M / stock $10M — gate loại bỏ, không chỉ trừ điểm) + RS vs benchmark (BTC-USD / ^GSPC); phạt đu đỉnh (RSI≥75, RVOL≥4, ATR>20%) · ĐÃ IMPLEMENT) · rev 5: §12 mới GET /api/performance — metrics trade replay từ engine audit log (fill phase=execute FIFO long-only per ticker; summary win/loss/expectancy, open_positions per lot mark qua price seam, brackets, recent_orders 50 dòng mới nhất; log thiếu/rỗng là empty state, không đọc được → 503 `audit_log_unreadable` như /api/audit); §13 mới autoloop + halt — GET/POST /api/autoloop (vòng lặp tự chạy theo interval 15–1440 phút, enable fail-closed 409 `gate_closed` qua cổng auto-confirm của engine: config literal + env flag), POST /api/autoloop/run-now (202), POST /api/halt + POST /api/halt/reset — kill switch không gate, line `halt`/`halt_reset` trong engine audit log mà RiskGuard của mọi process replay · ĐÃ IMPLEMENT cả hai phía · rev 6: đường futures trong autoloop — DerivativesExecutor qua 3 cổng (exec_derivatives config + env + confirm per-order của _handle_plan), leverage cap 3.0, bracket futures reduceOnly; gates() thêm 2 nửa exec_derivatives (observability) · ĐÃ IMPLEMENT cả hai phía · status: design + implementation song song (đã implement: §1–§4, §7–§9 — approve chạy đủ pipeline execute từ rev 3.1; thiết kế: §5 rev 4.1 đã implement auto mode; §6)
 audience: frontend + backend implementer của control-panel UI cho TradingAgents
 
 Hợp đồng này bọc engine hiện có **mà không sửa mã lõi `tradingagents/`**. Mọi mapping
@@ -848,9 +848,9 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 | 17| GET   | `/api/backtest`                  | `results_dir/backtest/*` + summarize |
 | 18| GET   | `/api/health`                    | mode/halt/key status |
 | 19| GET   | `/api/performance`               | đọc `exec_log_path` FIFO long-only (§12) |
-| 20| GET   | `/api/autoloop`                  | gates + state file `autoloop.json` (§13) |
+| 20| GET   | `/api/autoloop`                  | gates (thêm 2 nửa futures — chỉ quan sát) + state file `autoloop.json` (§13, §14) |
 | 21| POST  | `/api/autoloop`                  | fail-closed 409 gate_closed (§13) |
-| 22| POST  | `/api/autoloop/run-now`          | 1 chu kỳ screen→propagate→plan→`_handle_plan` (§13) |
+| 22| POST  | `/api/autoloop/run-now`          | 1 chu kỳ screen→propagate→plan→`_handle_plan`; crypto qua `DerivativesExecutor` khi `exec_derivatives` bật — futures long/short, đòn bẩy ≤3× (§14) |
 | 23| POST  | `/api/halt`                      | append `{"event": "halt"}` — RiskGuard mọi process chặn hôm nay |
 | 24| POST  | `/api/halt/reset`                | append `{"event": "halt_reset"}` |
 
@@ -951,7 +951,7 @@ Trạng thái: loading · **empty** (chưa có fill nào — `summary` toàn 0, 
 
 Nguồn: `server/autoloop.py`. Scheduler là daemon thread re-read state file (`server/data/autoloop.json` — `paths.AUTOLOOP_PATH`, `server/paths.py:17`) mỗi wake, nên đổi interval/enabled có hiệu lực ở wake kế tiếp, không cần restart (`autoloop.py:152-172`). Một cycle = sàng universe (12 mã/asset → top 3, như daily auto scan) → pipeline LLM per candidate → **mọi plan resolve qua confirm policy của engine `_handle_plan`** (`tradingagents/execution/daily.py`) — plan không execute chỉ được audit; candidate stock chỉ advisory (không sinh plan). Cycle khi run/job active → skip + audit `autoloop_cycle_skipped` (`autoloop.py:198-218`).
 
-- **Enable fail-closed** (`autoloop.py:88-105, 373-381`): `all_open` = config `exec_auto_confirm is True` **và** env `TRADINGAGENTS_EXEC_AUTO_CONFIRM` true — đúng hai nửa đầu của confirm policy; hai nửa `exec_live` chỉ hiển thị để quan sát, không mở API này (live là quyết định của engine policy theo FR5).
+- **Enable fail-closed** (`autoloop.py:88-105, 373-381`): `all_open` = config `exec_auto_confirm is True` **và** env `TRADINGAGENTS_EXEC_AUTO_CONFIRM` true — đúng hai nửa đầu của confirm policy; hai nửa `exec_live` chỉ hiển thị để quan sát, không mở API này (live là quyết định của engine policy theo FR5). Rev 6: `gates` thêm 2 nửa `exec_derivatives_config`/`exec_derivatives_env` — cũng chỉ quan sát (futures là quyết định của executor policy, §14).
 - **Kill switch không gate** (`autoloop.py:405-432`): `POST /api/halt` ghi `{"event": "halt", "timestamp", "reason"}` vào engine audit log — RiskGuard của MỌI process replay line này và từ chối phần còn lại của hôm nay cho tới reset hoặc UTC day roll (sticky, day-scoped — `risk.py:163-173`; timestamp là thứ làm halt day-scoped — `risk.py:111-119`). `halt_reset` hôm nay gỡ sticky cho tới breach/halt mới. Đổi so với §11.9 (risk cũ "không có endpoint reset halt trong v1"): rev 5 đưa reset thành endpoint tường minh `/api/halt/reset`.
 
 ### GET /api/autoloop
@@ -969,6 +969,8 @@ Response 200:
     "auto_confirm_env": false,
     "exec_live_config": false,
     "exec_live_env": false,
+    "exec_derivatives_config": false,
+    "exec_derivatives_env": false,
     "all_open": false
   },
   "last_cycle": null
@@ -1012,3 +1014,23 @@ Response 202:
 Body `{}`. `halt` → 200 `{ "generated_at": "…", "halted": true }`; `halt/reset` → 200 `{ "generated_at": "…", "halted": false }`. Cả hai ghi line điều khiển vào engine audit log (§7) và audit server trail `autoloop_halt` / `autoloop_halt_reset`; sau action, `GET /api/health` → `halted_today` (§9) phản ánh ngay.
 
 Trạng thái POSTs: loading · error 415/403 CSRF (§0) · stale (n/a — action).
+
+---
+
+## 14. Đường futures trong autoloop (rev 6)
+
+Ứng viên crypto của 1 chu kỳ autoloop đi qua `DerivativesExecutor` thay vì spot bridge khi config `exec_derivatives` là literal True — executor được dựng 1 lần/cycle (`autoloop.py:253-254`, seam test `_build_derivatives_executor` — `autoloop.py:338-344`); ứng viên stock vẫn chỉ advisory như §13.
+
+**3 cổng — UI không giữ cổng nào:**
+
+1. **Config** — `exec_derivatives is True`: chặn lúc cycle quyết định dùng executor (`autoloop.py:254`) và chặn lần nữa trong `plan_order`/`execute_order` của executor (`derivatives.py:125-131, 191`).
+2. **Env** — `TRADINGAGENTS_EXEC_DERIVATIVES` đọc tại call time, fail-closed (`derivatives.py:45`, gate ở `derivatives.py:132, 198`): thiếu → plan bị refuse (audit `derivatives_denied`), candidate ghi refusal vào `reason`, cycle vẫn hoàn thành (`tests/test_server_autoloop.py::test_run_cycle_derivatives_gates_closed_refuse_planning`).
+3. **Confirm per-order** — mọi plan vẫn resolve qua `_handle_plan` của engine (`daily.py:177-216`, gọi ở `autoloop.py:310`): hai gate auto-confirm (config literal + env flag) quyết định dry-fill, live bị chặn bởi FR5 của bridge mà executor compose (`effective_mode` delegate — `derivatives.py:415`). Autoloop không thêm cổng mới, chỉ đi qua cổng cũ của engine.
+
+Hai nửa (1)+(2) hiển thị trong `gates()` là `exec_derivatives_config`/`exec_derivatives_env` — **chỉ quan sát**, không tham gia `all_open` (`autoloop.py:116-118`); enable autoloop vẫn chỉ cần 2 nửa auto-confirm.
+
+**Đòn bẩy:** cycle xin `min(risk_max_derivatives_leverage, MAX_AUTO_LEVERAGE = 3.0)`; thiếu config entry → 1× (`_auto_leverage` — `autoloop.py:62, 347-353`). RiskGuard với `risk_max_derivatives_leverage` vẫn là gate có thẩm quyền (từ chối được dưới trần hệ thống); executor pin leverage trên venue cho mỗi lệnh (`derivatives.py:321-324`).
+
+**Bracket futures** (SL/TP là lớp kiểm rủi ro chính — không thêm bộ lọc chặn tín hiệu): Sell/Underweight mở SHORT qua mapping `RATINGS_5_TIER` (`_direction` — `autoloop.py:70-72, 356-359`; side `sell` không cần position sẵn — `derivatives.py:113-117`). Bracket gắn theo hướng qua `atr_targets_signed`: short = stop TRÊN entry, target DƯỚI (`screening.py:405-448`); thiếu ATR → vào lệnh không bracket, không bịa số (`_attach_bracket` — `autoloop.py:362-372`). Trên venue, bracket là lệnh close ngược chiều entry với `reduceOnly: True` + unified `stopLoss`/`takeProfit` (`_place_bracket` — `derivatives.py:359-411`): reduceOnly bắt buộc để stop của short không MỞ long mới. Bracket fail sau khi entry đã khớp → audit `bracket_failed`, fill giữ nguyên (`derivatives.py:359-411`).
+
+**Mặc định:** đường futures chạy dry/testnet trừ khi FR5 live double-gate của bridge mở — live vẫn là quyết định của engine policy, không phải của autoloop hay UI.

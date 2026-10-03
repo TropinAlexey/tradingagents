@@ -399,6 +399,22 @@ def atr_targets(
     without a second market read. ``(None, None)`` when ATR is unavailable —
     the caller then enters without a bracket rather than inventing distances.
     """
+    return atr_targets_signed(ticker, curr_date, "long")
+
+
+def atr_targets_signed(
+    ticker: str, curr_date: str, direction: str
+) -> tuple[float | None, float | None]:
+    """(stop_loss, take_profit) for a LONG or SHORT entry at the last close.
+
+    The ATR distances are identical for both directions; only the side of the
+    entry price flips: a long stops BELOW entry and targets ABOVE it, a short
+    mirrors that (stop ABOVE, target BELOW), so a short plan satisfies
+    ``stop > entry > take``. ``(None, None)`` when ATR is unavailable — the
+    caller then enters without a bracket rather than inventing distances.
+    """
+    if direction not in ("long", "short"):
+        raise ValueError(f"direction must be 'long' or 'short', got {direction!r}")
     try:
         data = load_ohlcv(ticker, curr_date, fill_gaps=True)
     except (VendorError, OSError, ValueError, KeyError) as exc:
@@ -423,6 +439,10 @@ def atr_targets(
     atr_pct = atr / last * 100.0
     stop_dist = min(max(atr_pct * _STOP_ATR_MULT, _STOP_MIN_PCT), _STOP_MAX_PCT)
     tp_dist = min(max(atr_pct * _TAKE_PROFIT_ATR_MULT, _TP_MIN_PCT), _TP_MAX_PCT)
-    return round(last * (1.0 - stop_dist / 100.0), 8), round(
-        last * (1.0 + tp_dist / 100.0), 8
+    if direction == "long":
+        return round(last * (1.0 - stop_dist / 100.0), 8), round(
+            last * (1.0 + tp_dist / 100.0), 8
+        )
+    return round(last * (1.0 + stop_dist / 100.0), 8), round(
+        last * (1.0 - tp_dist / 100.0), 8
     )

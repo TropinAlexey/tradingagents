@@ -121,7 +121,8 @@ def test_get_autoloop_defaults(client):
     # keep every gate closed: the fail-closed default is the loop can't arm.
     assert body["gates"] == {
         "auto_confirm_config": False, "auto_confirm_env": False,
-        "exec_live_config": False, "exec_live_env": False, "all_open": False,
+        "exec_live_config": False, "exec_live_env": False,
+        "exec_derivatives_config": False, "exec_derivatives_env": False, "all_open": False,
     }
     assert body["last_cycle"] is None
 
@@ -162,6 +163,7 @@ def test_enable_with_gates_open_persists_state_and_arms_scheduler(client, tmp_pa
     assert body["interval_minutes"] == 30
     assert body["gates"]["all_open"] is True
     assert body["gates"]["exec_live_config"] is False  # reported, never required to enable
+    assert body["gates"]["exec_derivatives_config"] is False  # futures: observability only, never required
 
     state = json.loads((tmp_path / "autoloop.json").read_text(encoding="utf-8"))
     assert state == {"enabled": True, "interval_minutes": 30, "updated_at": state["updated_at"]}
@@ -346,8 +348,8 @@ def test_run_cycle_auto_confirms_dry_buy_with_bracket(tmp_path, monkeypatch):
         {"ticker": "BTC-USD", "asset_type": "crypto"},
         {"ticker": "NVDA", "asset_type": "stock"},
     ])
-    monkeypatch.setattr(screening_mod, "atr_targets",
-                        lambda ticker, date, asset_type="crypto": (_STOP, _TAKE))
+    monkeypatch.setattr(screening_mod, "atr_targets_signed",
+                        lambda ticker, date, direction: (_STOP, _TAKE))
 
     def build(config):
         from tradingagents.execution.bridge import ExchangeBridge
@@ -428,3 +430,130 @@ def test_run_cycle_skips_each_failing_candidate_but_completes(tmp_path, monkeypa
                     (tmp_path / "server-audit.jsonl").read_text(encoding="utf-8").splitlines()
                     if "autoloop_cycle_completed" in line]
     assert completed["results"][0]["reason"] == "RuntimeError: LLM relay down"
+
+
+# --- the cycle through the derivatives path (FR-D) --------------------------------
+
+
+class _StubDerivVenue(_StubVenue):
+    """Same constant answers as the spot stub, shaped for the derivatives
+    executor: unified symbols, leverage pinning, precision."""
+
+    def amount_to_precision(self, symbol: str, amount: float) -> str:
+        return f"{float(amount):.6f}"
+
+    def set_leverage(self, leverage: int, symbol: str, params=None) -> None:
+        pass
+
+
+def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None):
+    """Gates + screening fakes for a derivatives-path cycle: the FR-D gates
+    armed in config AND env (planning refuses otherwise), exec_live closed so
+    _handle_plan can only ever dry-run, and the executor seam replaced by a
+    factory over the stub venue."""
+    engine_audit = tmp_path / "engine-audit.jsonl"
+    set_config({
+        "exec_auto_confirm": True, "exec_live": False,
+        "exec_derivatives": True,
+        # Risk caps sized for the 3x plan the cycle requests: margin = 25% of
+        # cash 9500 = 2375, notional at 3x = 7125 = 75% of equity — so every
+        # percentage cap must sit at/above 75% and the leverage cap at 3x.
+        "risk_max_derivatives_leverage": 3.0,
+        "risk_max_derivatives_exposure_pct": 100.0,
+        "risk_max_position_pct_per_asset": 100.0,
+        "risk_max_total_exposure_pct": 100.0,
+        "exec_log_path": str(engine_audit),
+        **(config_extra or {}),
+    })
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", "true")
+
+    monkeypatch.setattr(screening_mod, "crypto_universe", lambda config, top_n: ["BTC-USD"])
+    monkeypatch.setattr(screening_mod, "stock_universe", lambda config, top_n: [])
+    monkeypatch.setattr(screening_mod, "screen_universe",
+                        lambda crypto, stocks, date, top_n: [{"ticker": "BTC-USD", "asset_type": "crypto"}])
+
+    def build(config):
+        from tradingagents.execution.derivatives import DerivativesExecutor
+
+        return DerivativesExecutor(config=config, exchange_factory=_StubDerivVenue)
+
+    monkeypatch.setattr(autoloop_mod, "_build_derivatives_executor", build)
+    monkeypatch.setattr(screening_mod, "atr_targets_signed",
+                        lambda ticker, date, direction: (
+                            (_STOP, _TAKE) if direction == "long" else (_TAKE, _STOP)
+                        ))
+    return engine_audit
+
+
+def test_run_cycle_derivatives_dry_buy_long_bracket(tmp_path, monkeypatch):
+    """exec_derivatives armed: the crypto candidate plans through the
+    DerivativesExecutor (leverage clamped to the system cap) and the Buy's
+    dry fill carries the LONG bracket (stop below entry, target above)."""
+    engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+
+    (btc,) = results
+    assert btc.executed is True
+    assert btc.plan.market == "derivatives"
+    assert btc.plan.leverage == autoloop_mod.MAX_AUTO_LEVERAGE
+    assert btc.plan.side == "buy"
+    assert btc.plan.stop_loss == _STOP and btc.plan.take_profit == _TAKE
+
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+    (plan_buy,) = [event for event in events if event.get("phase") == "plan" and event.get("action") == "buy"]
+    (dry_buy,) = [event for event in events if event.get("phase") == "execute" and event.get("action") == "buy"]
+    assert plan_buy["market"] == "derivatives" and plan_buy["leverage"] == autoloop_mod.MAX_AUTO_LEVERAGE
+    assert dry_buy["mode"] == "dry" and dry_buy["confirmed"] is True
+    assert all(event.get("mode") != "live" for event in events)
+
+
+def test_run_cycle_derivatives_dry_sell_short_bracket(tmp_path, monkeypatch):
+    """A Sell signal opens a SHORT on the derivatives path: the bracket is
+    mirrored (stop ABOVE entry, target BELOW, i.e. stop > entry > take) —
+    the risk direction the long-only spot path never produces."""
+    engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Sell"))
+
+    (btc,) = results
+    assert btc.signal == "Sell"
+    assert btc.executed is True
+    assert btc.plan.market == "derivatives"
+    assert btc.plan.side == "sell"  # short opener, no held position required
+    # short: stop above entry, take below — the mirror of the long bracket
+    assert btc.plan.stop_loss == _TAKE and btc.plan.take_profit == _STOP
+    assert btc.plan.stop_loss > btc.plan.estimated_price > btc.plan.take_profit
+
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+    (plan_sell,) = [event for event in events if event.get("phase") == "plan" and event.get("action") == "sell"]
+    (dry_sell,) = [event for event in events if event.get("phase") == "execute" and event.get("action") == "sell"]
+    assert plan_sell["market"] == "derivatives"
+    assert dry_sell["mode"] == "dry" and dry_sell["confirmed"] is True
+
+
+def test_run_cycle_derivatives_gates_closed_refuse_planning(tmp_path, monkeypatch):
+    """The derivatives executor's own gates still decide: config armed but the
+    TRADINGAGENTS_EXEC_DERIVATIVES env flag missing fails closed — the
+    candidate records the refusal, the cycle completes (a candidate's failure
+    never stops the cycle)."""
+    engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch)
+    monkeypatch.delenv("TRADINGAGENTS_EXEC_DERIVATIVES", raising=False)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+
+    (btc,) = results
+    assert btc.executed is False and btc.plan is None
+    assert "TRADINGAGENTS_EXEC_DERIVATIVES" in (btc.reason or "")
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert events[-1]["action"] == "derivatives_denied"
+    assert autoloop_mod._last_cycle["status"] == "completed"
+
+
+def test_auto_leverage_clamped_to_system_cap():
+    """The cycle's requested leverage = the configured risk cap clamped to
+    MAX_AUTO_LEVERAGE; a missing entry means 1x (RiskLimits' default)."""
+    assert autoloop_mod._auto_leverage({}) == 1.0
+    assert autoloop_mod._auto_leverage({"risk_max_derivatives_leverage": 2.0}) == 2.0
+    assert autoloop_mod._auto_leverage({"risk_max_derivatives_leverage": 10.0}) == autoloop_mod.MAX_AUTO_LEVERAGE

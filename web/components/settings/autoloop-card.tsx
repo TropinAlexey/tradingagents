@@ -275,19 +275,27 @@ export function AutoloopCard() {
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-4">
-        {/* (1) Bảng 4 cổng an toàn — chỉ đọc, cùng nguồn với chính sách của engine. */}
+        {/* (1) Bảng 6 hàng cổng an toàn — chỉ đọc, cùng nguồn với chính sách của engine. */}
         <section aria-label="Cổng an toàn">
           <ul className="space-y-2">
-            {AUTOLOOP_GATE_ROWS.map(({ key, label }) => (
+            {AUTOLOOP_GATE_ROWS.map(({ key, label, hint }) => (
               <li
                 key={key}
                 className="flex flex-wrap items-center justify-between gap-2 border-t py-2 first:border-t-0 first:pt-0"
               >
-                <span className="text-sm">{label}</span>
+                <span className="text-sm">
+                  {label}
+                  {hint ? <span className="block text-xs text-muted-foreground">{hint}</span> : null}
+                </span>
                 <GateBadge open={gates[key]} />
               </li>
             ))}
           </ul>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Bật futures cần đặt exec_derivatives=True trong .env theo hướng dẫn — vòng tự động sẽ mở
+            long/short đòn bẩy cho ứng viên crypto khi cổng này mở (đòn bẩy tối đa 3×, trần exposure
+            do RiskGuard kiểm).
+          </p>
           <p
             className={cn(
               "mt-2 text-sm font-medium",

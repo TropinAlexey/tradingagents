@@ -24,15 +24,18 @@ FROZEN_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
 
 
 class FakeDerivExchange:
-    """Offline ccxt stand-in that also records set_leverage."""
+    """Offline ccxt stand-in that also records set_leverage and full
+    create_order kwargs (bracket params must be assertable)."""
 
     def __init__(self, *, api_key="test-key", secret="test-secret", price=50_000.0,
-                 create_order_error=None):
+                 create_order_error=None, bracket_error=None):
         self.apiKey = api_key
         self.secret = secret
         self.price = price
         self.create_order_error = create_order_error
+        self.bracket_error = bracket_error
         self.calls = []
+        self.bracket_calls = []
         self._markets_loaded = False
 
     def fetch_ticker(self, symbol):
@@ -54,7 +57,9 @@ class FakeDerivExchange:
         self.calls.append(("set_leverage", leverage, symbol))
 
     def create_order(self, symbol, order_type, side, amount, price=None, params=None):
-        self.calls.append(("create_order", symbol, order_type, side, amount))
+        self.calls.append(("create_order", symbol, order_type, side, amount, params))
+        if self.bracket_error is not None and params:
+            raise self.bracket_error
         if self.create_order_error is not None:
             raise self.create_order_error
         return {"id": "deriv-123"}
@@ -352,7 +357,7 @@ def test_live_execute_places_market_order(tmp_path, monkeypatch):
     order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0)
     order_id = executor.execute_order(order, confirm=True, portfolio=book)
     assert order_id == "deriv-123"
-    assert ("create_order", "BTC/USDT:USDT", "market", "buy", "0.005000") in exchange.calls
+    assert ("create_order", "BTC/USDT:USDT", "market", "buy", "0.005000", None) in exchange.calls
     kinds = [call[0] for call in exchange.calls]
     assert kinds.index("load_markets") < kinds.index("amount_to_precision") < kinds.index("create_order")
     event = read_audit(tmp_path)[-1]
@@ -512,6 +517,93 @@ def test_no_secrets_in_any_audit_line(tmp_path, monkeypatch):
     text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
     assert "sentinel-key-123" not in text
     assert "sentinel-secret-456" not in text
+
+
+# --- exchange-side brackets on derivatives (reduceOnly required) -----------------
+
+
+def _live_bracket_order(executor, book):
+    order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0)
+    return order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 55_000.0})
+
+
+def test_live_bracket_long_closes_sell_with_reduce_only(tmp_path, monkeypatch):
+    """A bracketed LONG entry is followed by a reduceOnly sell close carrying
+    both stop and target as unified ccxt params."""
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    book = PortfolioContext(cash=1_000.0)
+    order = _live_bracket_order(executor, book)
+    executor.execute_order(order, confirm=True, portfolio=book)
+    bracket_calls = [call for call in exchange.calls
+                     if call[0] == "create_order" and call[5]]
+    assert bracket_calls == [(
+        "create_order", "BTC/USDT:USDT", "market", "sell", order.quantity,
+        {"stopLoss": {"stopPrice": 48_000.0}, "takeProfit": {"stopPrice": 55_000.0},
+         "reduceOnly": True},
+    )]
+    actions = [event["action"] for event in read_audit(tmp_path)]
+    assert "bracket_placed" in actions
+
+
+def test_live_bracket_short_closes_buy_with_reduce_only(tmp_path, monkeypatch):
+    """A SELL entry (a short opener) gets a reduceOnly BUY close -- the
+    mirrored close side the spot path never needs."""
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    book = PortfolioContext(cash=1_000.0)
+    order = executor.plan_order("BTC-USD", "Sell", book, price=50_000.0)
+    order = order.model_copy(update={"stop_loss": 52_000.0, "take_profit": 45_000.0})
+    executor.execute_order(order, confirm=True, portfolio=book)
+    bracket_calls = [call for call in exchange.calls
+                     if call[0] == "create_order" and call[5]]
+    assert bracket_calls == [(
+        "create_order", "BTC/USDT:USDT", "market", "buy", order.quantity,
+        {"stopLoss": {"stopPrice": 52_000.0}, "takeProfit": {"stopPrice": 45_000.0},
+         "reduceOnly": True},
+    )]
+
+
+def test_live_entry_without_bracket_sends_no_close_order(tmp_path, monkeypatch):
+    """No SL/TP on the plan -> exactly one order (the entry), nothing else."""
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    book = PortfolioContext(cash=1_000.0)
+    order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0)
+    executor.execute_order(order, confirm=True, portfolio=book)
+    entry_calls = [call for call in exchange.calls if call[0] == "create_order"]
+    assert entry_calls == [("create_order", "BTC/USDT:USDT", "market", "buy",
+                            "0.005000", None)]
+
+
+def test_bracket_failure_after_fill_is_audited_not_raised(tmp_path, monkeypatch):
+    """The entry already filled: a bracket exchange error must never discard
+    the fill or raise -- audited as bracket_failed, order id still returned."""
+    exchange = FakeDerivExchange(bracket_error=ccxt.ExchangeError("stop price invalid"))
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    book = PortfolioContext(cash=1_000.0)
+    order = _live_bracket_order(executor, book)
+    order_id = executor.execute_order(order, confirm=True, portfolio=book)
+    assert order_id == "deriv-123"  # the fill stands
+    event = read_audit(tmp_path)[-1]
+    assert event["action"] == "bracket_failed"
+    assert "stop price invalid" in event["reason"]
 
 
 def test_exports_expose_the_executor():

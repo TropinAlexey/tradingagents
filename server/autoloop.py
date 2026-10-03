@@ -38,6 +38,7 @@ from fastapi import APIRouter, Request
 
 from server import audit as audit_log, daily as daily_mod, paths, runs as runs_mod
 from server.contract import ApiError, json_body, utc_now_iso
+from tradingagents.agents.rating import RATINGS_5_TIER
 from tradingagents.dataflows.config import get_config
 from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.audit import append_event
@@ -54,11 +55,21 @@ MIN_INTERVAL_MINUTES = 15
 MAX_INTERVAL_MINUTES = 1440
 DEFAULT_INTERVAL_MINUTES = 1440
 
+# Hard system ceiling on the leverage an auto cycle may REQUEST from the
+# derivatives path, regardless of the configured risk cap. The RiskGuard's
+# own ``risk_max_derivatives_leverage`` stays the authoritative gate (it can
+# still refuse below this); this constant only bounds what the cycle asks for.
+MAX_AUTO_LEVERAGE = 3.0
+
 # Analyst sets per asset type, exactly like server/daily.py _analyze.
 _ANALYSTS_CRYPTO = ("market", "social", "news")
 _ANALYSTS_STOCK = ("market", "social", "news", "fundamentals")
 
 logger = logging.getLogger(__name__)
+
+# The 5-tier scale, unpacked like sizing.py/derivatives.py so the short-side
+# mapping can never drift from the rating vocabulary.
+_BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
 
 # One cycle at a time. The lock is held for the whole cycle; a concurrent
 # spawn (scheduler tick + run-now) loses the acquire and is a silent no-op.
@@ -90,8 +101,9 @@ def gates() -> dict:
 
     ``all_open`` (the enable precondition) is only the two auto-confirm
     halves: config literal True AND env true — matching ``_handle_plan``'s
-    first two checks. The FR5 live halves are reported for observability but
-    never unlock this API surface: live remains the engine policy's decision.
+    first two checks. The FR5 live halves and the FR-D derivatives halves are
+    reported for observability but never unlock this API surface: live and
+    futures remain the engine policy's decision.
     """
     config = get_config()
     auto_confirm_config = config.get("exec_auto_confirm") is True
@@ -101,6 +113,8 @@ def gates() -> dict:
         "auto_confirm_env": auto_confirm_env,
         "exec_live_config": config.get("exec_live") is True,
         "exec_live_env": _env_flag("TRADINGAGENTS_EXEC_LIVE"),
+        "exec_derivatives_config": config.get("exec_derivatives") is True,
+        "exec_derivatives_env": _env_flag("TRADINGAGENTS_EXEC_DERIVATIVES"),
         "all_open": auto_confirm_config and auto_confirm_env,
     }
 
@@ -237,8 +251,9 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
         summary["universe"] = {"crypto": len(crypto), "stock": len(stocks)}
         summary["candidates"] = [str(entry["ticker"]) for entry in candidates]
         bridge = _build_bridge(config)
+        derivatives = _build_derivatives_executor(config) if config.get("exec_derivatives") is True else None
         for candidate in candidates:
-            result = _process_candidate(bridge, candidate, config, build_graph)
+            result = _process_candidate(bridge, candidate, config, build_graph, derivatives)
             results.append(result)
             summary["results"].append(_result_summary(result))
     except Exception as exc:
@@ -256,15 +271,19 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
 
 
 def _process_candidate(
-    bridge: Any, candidate: dict, config: dict, build_graph: Callable
+    bridge: Any, candidate: dict, config: dict, build_graph: Callable,
+    derivatives: Any | None = None,
 ) -> DailyResult:
     """Analyze → plan → the engine's confirm policy for one candidate.
 
     Stock candidates are advisory: analysis runs, but the ccxt bridge cannot
     plan for them (bridge.py:174-186), so the signal is the deliverable.
-    Crypto plans are NEVER resolved here beyond ``_handle_plan`` — the 3-gate
-    auto-confirm policy alone decides execute-vs-wait, and what it does not
-    execute is only audited.
+    Crypto candidates go through ``DerivativesExecutor`` when the derivatives
+    executor is supplied (the cycle arms it when ``exec_derivatives`` is a
+    literal True in config), else through the spot bridge. Either way plans
+    are NEVER resolved here beyond ``_handle_plan`` — the 3-gate auto-confirm
+    policy alone decides execute-vs-wait, and what it does not execute is
+    only audited.
     """
     ticker = str(candidate["ticker"])
     asset_type = str(candidate.get("asset_type") or "crypto")
@@ -278,6 +297,17 @@ def _process_candidate(
                 "advisory only — signal from the stock pipeline; the venue "
                 "bridge only executes crypto, so no order plan"
             )
+            return result
+        if derivatives is not None:
+            portfolio = derivatives._bridge.sync_portfolio()
+            plan = derivatives.plan_order(
+                ticker, signal, portfolio=portfolio,
+                leverage=_auto_leverage(derivatives.config),
+            )
+            if plan.side is not None:
+                plan = _attach_bracket(plan, ticker, direction=_direction(signal))
+            result.plan = plan
+            _handle_plan(derivatives, plan, portfolio, result)
             return result
         portfolio = bridge.sync_portfolio()
         plan = bridge.plan_order(ticker, signal, portfolio=portfolio)
@@ -305,13 +335,38 @@ def _build_bridge(config: dict) -> Any:
     return ExchangeBridge(config=config)
 
 
-def _attach_bracket(plan: Any, ticker: str) -> Any:
-    """ATR-derived protective exits on an entry plan (server/daily.py's live
-    path): a missing ATR leaves the plan bracket-less rather than inventing
-    numbers — the audit shows why."""
-    from tradingagents.dataflows.screening import atr_targets
+def _build_derivatives_executor(config: dict) -> Any:
+    """The futures venue for the cycle's derivatives path (lazy import — the
+    executor composes the same bridge, so RiskGuard/audit/redaction keep
+    working unchanged). Tests monkeypatch this seam to inject a fake."""
+    from tradingagents.execution.derivatives import DerivativesExecutor
 
-    stop, take = atr_targets(ticker, _today_iso(), "crypto")
+    return DerivativesExecutor(config=config)
+
+
+def _auto_leverage(config: dict) -> float:
+    """Leverage the cycle requests from the derivatives path: the configured
+    ``risk_max_derivatives_leverage`` clamped to MAX_AUTO_LEVERAGE. A missing
+    config entry means 1x — the same default as RiskLimits."""
+    raw = config.get("risk_max_derivatives_leverage")
+    configured = 1.0 if raw is None else float(raw)
+    return min(configured, MAX_AUTO_LEVERAGE)
+
+
+def _direction(signal: str) -> str:
+    """Bracket direction for a 5-tier signal: Sell/Underweight open shorts on
+    the derivatives path, so their bracket mirrors the long side."""
+    return "short" if signal in (_SELL, _UNDERWEIGHT) else "long"
+
+
+def _attach_bracket(plan: Any, ticker: str, direction: str = "long") -> Any:
+    """ATR-derived protective exits on an entry plan (server/daily.py's live
+    path, direction-aware for derivatives): a long stops below and targets
+    above entry, a short mirrors that. A missing ATR leaves the plan
+    bracket-less rather than inventing numbers — the audit shows why."""
+    from tradingagents.dataflows.screening import atr_targets_signed
+
+    stop, take = atr_targets_signed(ticker, _today_iso(), direction)
     if stop is None or take is None:
         return plan
     return plan.model_copy(update={"stop_loss": stop, "take_profit": take})
