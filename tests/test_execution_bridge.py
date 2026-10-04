@@ -75,6 +75,22 @@ class FakeExchange:
         scaled = int(float(amount) * 1_000_000) / 1_000_000  # ccxt TRUNCATES
         return f"{scaled:.6f}"
 
+    def market_id(self, symbol):
+        return symbol.replace("/", "")
+
+    def price_to_precision(self, symbol, price):
+        return f"{float(price):.2f}"
+
+    def privatePostOrderListOco(self, request):
+        self.calls.append(("orderListOco", request))
+        if self.bracket_error is not None and self._filled >= 1:
+            raise self.bracket_error
+        self._filled += 1
+        return {"orderListId": 987654, "orders": [{"orderId": 111}, {"orderId": 222}]}
+
+    def private_post_order_list_oco(self, request):
+        return self.privatePostOrderListOco(request)
+
     def create_order(self, symbol, order_type, side, amount, price=None, params=None):
         self.calls.append(("create_order", symbol, order_type, side, amount, params))
         if self.create_order_error is not None:
@@ -331,18 +347,23 @@ def test_dry_audit_line_carries_planned_bracket(tmp_path, monkeypatch):
 
 
 def test_live_buy_fill_places_exchange_side_bracket(tmp_path, monkeypatch):
-    """After a live entry fill the protective exits are attached on the venue
-    via ccxt unified params — a second create_order call, audited."""
+    """After a live entry fill the protective exits are attached as ONE OCO
+    order list on the venue — verified live on testnet to surface as two
+    open orders (a LIMIT_MAKER TP above, a STOP_LOSS below)."""
     exchange = FakeExchange()
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     order = order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 53_000.0})
     bridge.execute_order(order, confirm=True)
-    bracket_calls = [c for c in exchange.calls if c[0] == "create_order" and c[3] == "sell"]
-    assert len(bracket_calls) == 1
-    _name, _symbol, _type, _side, amount, params = bracket_calls[0]
-    assert params["stopLoss"]["stopPrice"] == 48_000.0
-    assert params["takeProfit"]["stopPrice"] == 53_000.0
+    oco_calls = [c for c in exchange.calls if c[0] == "orderListOco"]
+    assert len(oco_calls) == 1
+    request = oco_calls[0][1]
+    assert request["symbol"] == "BTCUSDT"
+    assert request["side"] == "SELL"
+    assert request["aboveType"] == "LIMIT_MAKER"
+    assert request["abovePrice"] == "53000.00"
+    assert request["belowType"] == "STOP_LOSS"
+    assert request["belowStopPrice"] == "48000.00"
     actions = [e["action"] for e in read_audit(tmp_path)]
     assert "bracket_placed" in actions
 

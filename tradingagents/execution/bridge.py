@@ -476,27 +476,64 @@ class ExchangeBridge:
     def _place_bracket(self, order: PlannedOrder, confirm: bool) -> None:
         """Attach exchange-side protective exits after an entry fill.
 
-        The bracket lives on the venue (ccxt unified stopLoss/takeProfit
-        params → OCO on binance spot), so the stop survives this process
-        dying — the exchange enforces it, not us. A bracket that fails to
-        place AFTER the entry filled must never discard the fill or look
-        like a failed order (safety #4): it is audited loudly as
-        ``bracket_failed`` and the position stays, protected only by the
-        next daily loop's exit signals.
+        Binance spot: one OCO order list (``POST /api/v3/orderList/oco``) —
+        the above leg takes profit at the target, the below leg stops out,
+        and they share the same locked balance (two separate orders would
+        double-lock it and refuse). The bracket lives on the venue, so the
+        stop survives this process dying — the exchange enforces it, not us.
+        Verified live on testnet: both legs appear as open orders with the
+        entry amount. A bracket that fails to place AFTER the entry filled
+        must never discard the fill or look like a failed order (safety #4):
+        it is audited loudly as ``bracket_failed`` and the position stays,
+        protected only by the next daily loop's exit signals.
         """
         exchange = self._exchange_or_raise()
-        params: dict[str, Any] = {}
-        if order.stop_loss is not None:
-            params["stopLoss"] = {"stopPrice": order.stop_loss}
+        market_id = exchange.market_id(order.ccxt_symbol)
+        # A market buy's taker fee is charged in the received asset, so the
+        # filled base amount is slightly BELOW the planned quantity — the OCO
+        # must sell what is actually held (verified live: selling the planned
+        # quantity after a fill refuses with InsufficientFunds).
+        base = order.ccxt_symbol.split("/", 1)[0]
+        balance = exchange.fetch_balance()
+        held = float((balance.get("free") or {}).get(base, 0) or 0)
+        bracket_qty = exchange.amount_to_precision(
+            order.ccxt_symbol, min(float(order.quantity), held)
+        )
+        if not float(bracket_qty) > 0:
+            self._audit(
+                action="bracket_failed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                reason=f"no sellable {base} after the entry fill (free={held}); "
+                       "bracket not placed",
+                phase="execute",
+            )
+            return
+        request: dict[str, Any] = {
+            "symbol": market_id,
+            "side": "SELL",
+            "quantity": bracket_qty,
+        }
         if order.take_profit is not None:
-            params["takeProfit"] = {"stopPrice": order.take_profit}
+            request["aboveType"] = "LIMIT_MAKER"
+            request["abovePrice"] = exchange.price_to_precision(
+                order.ccxt_symbol, order.take_profit
+            )
+        if order.stop_loss is not None:
+            request["belowType"] = "STOP_LOSS"
+            request["belowStopPrice"] = exchange.price_to_precision(
+                order.ccxt_symbol, order.stop_loss
+            )
         import ccxt
 
         try:
-            response = exchange.create_order(
-                order.ccxt_symbol, "market", "sell", order.quantity,
-                None, params,
-            )
+            # The camelCase implicit method (ccxt generates no snake_case
+            # alias for this endpoint in 4.5.x) — verified on testnet.
+            place = getattr(exchange, "privatePostOrderListOco", None)
+            if place is None:
+                raise RuntimeError("exchange client does not expose orderList/oco")
+            response = place(request)
         except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
             self._audit(
                 action="bracket_failed",
@@ -517,15 +554,15 @@ class ExchangeBridge:
                 phase="execute",
             )
             return
-        bracket_id = response.get("id") if isinstance(response, dict) else None
+        bracket_id = response.get("orderListId") if isinstance(response, dict) else None
         try:
             self._audit(
                 action="bracket_placed",
                 order=order,
                 mode="live",
                 confirmed=confirm,
-                order_id=bracket_id,
-                reason="exchange-side stopLoss/takeProfit attached after entry fill",
+                order_id=str(bracket_id) if bracket_id is not None else None,
+                reason="exchange-side OCO stopLoss/takeProfit attached after entry fill",
                 phase="execute",
             )
         except OSError as exc:
