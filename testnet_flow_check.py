@@ -17,6 +17,10 @@ import os
 import sys
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+
+load_dotenv()  # .env: BINANCE_API_KEY/SECRET (testnet spot), BINANCE_DEMO_API_KEY/SECRET (futures demo)
+
 os.environ["TRADINGAGENTS_EXEC_SANDBOX"] = "true"
 os.environ["TRADINGAGENTS_EXEC_LIVE"] = "true"
 os.environ["TRADINGAGENTS_EXEC_AUTO_CONFIRM"] = "true"
@@ -227,22 +231,36 @@ def layer_futures() -> None:
          ", ".join(f"{p['symbol']} contracts={p.get('contracts')} leverage={p.get('leverage')}"
                    for p in live) or "none")
 
-    orders = open_bracket_orders(client, symbol)
-    step("futures: reduceOnly bracket live on venue", len(orders) >= 1,
-         f"{len(orders)} protective order(s): "
-         + ", ".join(f"{o.get('side')}@{o.get('stopPrice') or o.get('triggerPrice') or o.get('price')}"
-                     for o in orders[:4]))
+    # Conditional (algo) legs do NOT appear in classic fetch_open_orders —
+    # they rest in the Algo Order API surface (fapiPrivateGetOpenAlgoOrders,
+    # a bare list). The bracket is 2 legs: STOP_MARKET below + TAKE_PROFIT
+    # above, both reduceOnly.
+    market_id = client.market_id(symbol)
+    algo = client.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+    algo_orders = algo if isinstance(algo, list) else algo.get("orders", [])
+    step("futures: reduceOnly bracket live on venue", len(algo_orders) >= 2,
+         f"{len(algo_orders)} algo leg(s): "
+         + ", ".join(f"{o.get('orderType')}@{o.get('triggerPrice') or o.get('stopPrice')}"
+                     for o in algo_orders[:4]))
 
     if live:
         client.create_order(symbol, "market", "sell",
                             client.amount_to_precision(symbol, live[0]["contracts"]),
                             params={"reduceOnly": True})
-    for order in orders:
-        client.cancel_order(order["id"], symbol)
+    for order in algo_orders:
+        with contextlib.suppress(Exception):
+            client.fapiPrivateDeleteAlgoOrder({"symbol": market_id,
+                                               "algoId": order.get("algoId")})
+    for order in client.fetch_open_orders(symbol):
+        with contextlib.suppress(Exception):
+            client.cancel_order(order["id"], symbol)
     positions = client.fetch_positions([symbol])
     remaining = [p for p in positions if abs(float(p.get("contracts") or 0)) > 0]
-    step("futures: cleanup flattened the position", len(remaining) == 0,
-         f"positions left={len(remaining)}")
+    leftover_algo = client.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+    leftover = leftover_algo if isinstance(leftover_algo, list) else leftover_algo.get("orders", [])
+    step("futures: cleanup flattened the position",
+         len(remaining) == 0 and len(leftover) == 0,
+         f"positions left={len(remaining)}, algo orders left={len(leftover)}")
 
 
 if __name__ == "__main__":

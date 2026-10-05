@@ -360,11 +360,19 @@ class DerivativesExecutor:
         """Attach exchange-side protective exits after a derivatives entry fill.
 
         A ``sell`` is a short opener (FR-D1), so the closing side mirrors the
-        entry: long -> sell close, short -> buy close. Futures require
-        ``reduceOnly`` on the bracket (it may only reduce the entry
-        position -- without it a stop on a short would OPEN a fresh long).
-        The bracket lives on the venue (ccxt unified stopLoss/takeProfit
-        params), so the stop survives this process dying. A bracket that
+        entry: long -> sell close, short -> buy close. Every leg carries
+        ``reduceOnly`` (it may only reduce the entry position — without it a
+        stop on a short would OPEN a fresh long).
+
+        The legs go through ccxt's unified FLAT conditional params
+        (``stopLossPrice`` / ``takeProfitPrice``): those route to the venue's
+        conditional-order surface (Binance USDT-M: the Algo Order API,
+        ``fapiPrivatePostAlgoOrder`` with algoType=CONDITIONAL — verified on
+        the demo venue). The nested attached form (``stopLoss``/``takeProfit``
+        dicts) must NOT be used: ccxt posts it to the classic order endpoint,
+        where the venue silently drops the trigger and the leg fills as a
+        market order — closing the position instantly. The bracket lives on
+        the venue, so the stop survives this process dying. A bracket that
         fails AFTER the entry filled must never discard the fill or look
         like a failed order (safety #4): it is audited loudly as
         ``bracket_failed`` and the position stays, protected only by the
@@ -372,18 +380,25 @@ class DerivativesExecutor:
         """
         close_side = "sell" if order.side == "buy" else "buy"
         exchange = self._bridge.client()
-        params: dict[str, Any] = {"reduceOnly": True}
+        legs: list[tuple[str, dict[str, Any]]] = []
         if order.stop_loss is not None:
-            params["stopLoss"] = {"stopPrice": order.stop_loss}
+            legs.append(("stop-loss", {"stopLossPrice": order.stop_loss}))
         if order.take_profit is not None:
-            params["takeProfit"] = {"stopPrice": order.take_profit}
+            legs.append(("take-profit", {"takeProfitPrice": order.take_profit}))
+        if not legs:
+            return
         import ccxt
 
+        placed_ids: list[str] = []
         try:
-            response = exchange.create_order(
-                order.ccxt_symbol, "market", close_side, order.quantity,
-                None, params,
-            )
+            for _leg_name, leg_params in legs:
+                response = exchange.create_order(
+                    order.ccxt_symbol, "market", close_side, order.quantity,
+                    None, {**leg_params, "reduceOnly": True},
+                )
+                leg_id = response.get("id") if isinstance(response, dict) else None
+                if leg_id is not None:
+                    placed_ids.append(str(leg_id))
         except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
             self._bridge.audit_plan(
                 order, action="bracket_failed",
@@ -398,12 +413,12 @@ class DerivativesExecutor:
                 confirmed=confirm, phase="execute",
             )
             return
-        bracket_id = response.get("id") if isinstance(response, dict) else None
+        bracket_id = ",".join(placed_ids) if placed_ids else None
         try:
             self._bridge.audit_plan(
                 order, action="bracket_placed",
                 confirmed=confirm, order_id=bracket_id,
-                reason="exchange-side stopLoss/takeProfit attached after derivatives fill",
+                reason="exchange-side conditional stopLoss/takeProfit attached after derivatives fill",
                 phase="execute",
             )
         except OSError as exc:

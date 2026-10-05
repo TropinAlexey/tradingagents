@@ -528,8 +528,9 @@ def _live_bracket_order(executor, book):
 
 
 def test_live_bracket_long_closes_sell_with_reduce_only(tmp_path, monkeypatch):
-    """A bracketed LONG entry is followed by a reduceOnly sell close carrying
-    both stop and target as unified ccxt params."""
+    """A bracketed LONG entry is followed by TWO reduceOnly conditional legs
+    (stop below + target above) routed through the venue's conditional-order
+    surface via the unified flat stopLossPrice/takeProfitPrice params."""
     exchange = FakeDerivExchange()
     executor = make_executor(
         tmp_path, monkeypatch,
@@ -541,18 +542,20 @@ def test_live_bracket_long_closes_sell_with_reduce_only(tmp_path, monkeypatch):
     executor.execute_order(order, confirm=True, portfolio=book)
     bracket_calls = [call for call in exchange.calls
                      if call[0] == "create_order" and call[5]]
-    assert bracket_calls == [(
-        "create_order", "BTC/USDT:USDT", "market", "sell", order.quantity,
-        {"stopLoss": {"stopPrice": 48_000.0}, "takeProfit": {"stopPrice": 55_000.0},
-         "reduceOnly": True},
-    )]
+    assert bracket_calls == [
+        ("create_order", "BTC/USDT:USDT", "market", "sell", order.quantity,
+         {"stopLossPrice": 48_000.0, "reduceOnly": True}),
+        ("create_order", "BTC/USDT:USDT", "market", "sell", order.quantity,
+         {"takeProfitPrice": 55_000.0, "reduceOnly": True}),
+    ]
     actions = [event["action"] for event in read_audit(tmp_path)]
     assert "bracket_placed" in actions
 
 
 def test_live_bracket_short_closes_buy_with_reduce_only(tmp_path, monkeypatch):
-    """A SELL entry (a short opener) gets a reduceOnly BUY close -- the
-    mirrored close side the spot path never needs."""
+    """A SELL entry (a short opener) gets reduceOnly BUY conditional legs --
+    the mirrored close side the spot path never needs: stop ABOVE entry,
+    target BELOW."""
     exchange = FakeDerivExchange()
     executor = make_executor(
         tmp_path, monkeypatch,
@@ -565,11 +568,12 @@ def test_live_bracket_short_closes_buy_with_reduce_only(tmp_path, monkeypatch):
     executor.execute_order(order, confirm=True, portfolio=book)
     bracket_calls = [call for call in exchange.calls
                      if call[0] == "create_order" and call[5]]
-    assert bracket_calls == [(
-        "create_order", "BTC/USDT:USDT", "market", "buy", order.quantity,
-        {"stopLoss": {"stopPrice": 52_000.0}, "takeProfit": {"stopPrice": 45_000.0},
-         "reduceOnly": True},
-    )]
+    assert bracket_calls == [
+        ("create_order", "BTC/USDT:USDT", "market", "buy", order.quantity,
+         {"stopLossPrice": 52_000.0, "reduceOnly": True}),
+        ("create_order", "BTC/USDT:USDT", "market", "buy", order.quantity,
+         {"takeProfitPrice": 45_000.0, "reduceOnly": True}),
+    ]
 
 
 def test_live_entry_without_bracket_sends_no_close_order(tmp_path, monkeypatch):
