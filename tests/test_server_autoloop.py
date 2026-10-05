@@ -112,6 +112,10 @@ def client(_server_state):
 
 
 def test_get_autoloop_defaults(client):
+    # Pin the gate-closed state explicitly: the operator's default_config may
+    # legitimately arm auto_confirm (the sanctioned arming path), so the
+    # fail-closed contract is asserted against an explicit closed config.
+    set_config({"exec_auto_confirm": False})
     body = client.get("/api/autoloop").json()
     assert body["generated_at"].endswith("Z")
     assert body["enabled"] is False
@@ -134,6 +138,7 @@ def test_enable_gate_closed_is_409_and_armes_nothing(client, tmp_path, monkeypat
     started: list[bool] = []
     monkeypatch.setattr(autoloop_mod, "ensure_started", lambda: started.append(True))
     monkeypatch.setattr(autoloop_mod, "_spawn_cycle", lambda *args, **kwargs: "started")
+    set_config({"exec_auto_confirm": False})  # pin the gate-closed state
 
     response = client.post("/api/autoloop", json={"enabled": True})
     assert response.status_code == 409

@@ -15,6 +15,10 @@ WATCHLIST_PATH = DATA_DIR / "watchlist.json"
 APPROVALS_PATH = DATA_DIR / "approvals.jsonl"
 SERVER_AUDIT_PATH = DATA_DIR / "audit.jsonl"
 AUTOLOOP_PATH = DATA_DIR / "autoloop.json"
+# Operator-owned arming overrides (e.g. {"exec_auto_confirm": true}): the
+# shipped defaults stay fail-closed; an operator arms the gates through this
+# local, gitignored file instead of editing engine defaults.
+OPERATOR_CONFIG_PATH = DATA_DIR / "operator_config.json"
 
 
 def ensure_data_dir() -> None:

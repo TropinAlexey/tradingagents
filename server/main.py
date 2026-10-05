@@ -25,6 +25,7 @@ from server import (
     daily,
     health,
     history,
+    paths,
     performance,
     portfolio,
     runs,
@@ -47,8 +48,31 @@ ALLOWED_ORIGINS = {
 _STATE_CHANGING_METHODS = {"POST", "PUT", "DELETE"}
 
 
+def _apply_operator_config() -> None:
+    """Load the operator's arming overrides (server/data/operator_config.json)
+    into the process config at startup.
+
+    The shipped engine defaults stay fail-closed (tests pin them); an operator
+    arms gates like ``exec_auto_confirm`` through this local file instead of
+    editing engine code. Malformed or unreadable content is ignored — the
+    loop simply stays off.
+    """
+    import json
+
+    from tradingagents.dataflows.config import set_config
+
+    try:
+        data = json.loads(paths.OPERATOR_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict):
+        set_config({k: v for k, v in data.items() if not k.startswith("_")})
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    with suppress(OSError):  # an unreadable data dir must not keep the server down
+        _apply_operator_config()
     watchlist.ensure_seeded()
     with suppress(OSError):  # unreadable data dir must not keep the server down; the loop stays off
         autoloop.ensure_started()
