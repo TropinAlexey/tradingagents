@@ -2,8 +2,10 @@
 // kể cả body rỗng — quy tắc CSRF bắt buộc của backend (contract §0, server/main.py:48-65).
 import type {
   ApiErrorInfo,
+  DailyJobListResponse,
   DailyJobStart,
   DailyJobStatusResponse,
+  FuturesCyclesResponse,
   WatchlistResponse,
 } from "./scanner-types";
 import { parseErrorResponse } from "@/lib/api";
@@ -88,6 +90,23 @@ export const scannerApi = {
   dailyJob(jobId: string): Promise<DailyJobStatusResponse> {
     return requestJson<DailyJobStatusResponse>(
       `/api/daily/${encodeURIComponent(jobId)}`,
+    );
+  },
+  /** Lịch sử job + job đang chạy (contract §5 rev 7). */
+  dailyJobs(pageSize = 20): Promise<DailyJobListResponse> {
+    return requestJson<DailyJobListResponse>(`/api/daily?page_size=${pageSize}`);
+  },
+  futuresCycles(limit = 20): Promise<FuturesCyclesResponse> {
+    return requestJson<FuturesCyclesResponse>(`/api/autoloop/cycles?limit=${limit}`, {
+      cache: "no-store",
+    });
+  },
+  /** Dừng job đang chạy — trả về ngay khi job được đánh dấu dừng, không chờ
+   *  coin đang chạy dở kết thúc (một thread không thể bị kill an toàn). */
+  cancelDailyJob(jobId: string): Promise<DailyJobStatusResponse> {
+    return requestJson<DailyJobStatusResponse>(
+      `/api/daily/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST", headers: JSON_HEADERS, body: "{}" },
     );
   },
 };

@@ -24,15 +24,45 @@ export type AutoloopLastCycleResult = {
   take_profit: number | null;
 };
 
+export type AutoloopTelemetryEvent = {
+  event: "started" | "finished" | "failed";
+  stage: string;
+  ticker: string | null;
+  node: string | null;
+  started_at: string;
+  duration_ms?: number;
+  error_type?: string;
+};
+
+export type AutoloopTelemetry = {
+  active_stage: string | null;
+  active_ticker: string | null;
+  active_elapsed_ms: number | null;
+  active_node?: string | null;
+  active_path?: string[];
+  active_spans?: Array<{
+    stage: string;
+    ticker: string | null;
+    node: string | null;
+    started_at: string;
+    elapsed_ms: number;
+  }>;
+  last_stage: string | null;
+  current_ticker: string | null;
+  events: AutoloopTelemetryEvent[];
+  dropped_events: number;
+};
+
 export type AutoloopLastCycle = {
   started_at: string;
   finished_at: string | null;
-  status: string;
+  status: "running" | "completed" | "timeout" | "failed" | "skipped_busy";
   reason: string | null;
   error: string | null;
   candidates: string[];
   results: AutoloopLastCycleResult[];
   universe?: { crypto: number; stock: number };
+  telemetry?: AutoloopTelemetry;
 };
 
 export type AutoloopPayload = {

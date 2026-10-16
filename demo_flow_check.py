@@ -1,15 +1,15 @@
-"""Full-flow testnet verification — staged, fail-fast, no mainnet.
+"""Full-flow Binance Demo verification — staged, fail-fast, no production.
 
-Layer 1 (venue, spot): real ExchangeBridge with exec_sandbox + exec_live armed,
+Layer 1 (venue, spot): real ExchangeBridge with Binance Demo + live gates armed,
   a tiny long plan with an ATR bracket -> live fill -> exchange-side bracket ->
-  verify both orders exist on the venue -> close the position.
+  verify both orders exist on Demo -> close the position.
 
-Layer 2 (venue, futures): same through DerivativesExecutor (testnet USDT-M),
-  leverage 2, reduceOnly bracket, long then short -> verify -> close.
+Layer 2 (venue, futures): same through DerivativesExecutor (Binance Demo USDT-M),
+  leverage 2, reduceOnly bracket, long -> verify -> close.
 
-Safety: every stage asserts the client's hostnames are testnet BEFORE any order
-is sent; a non-testnet hostname aborts the run. Orders are tiny (1% of testnet
-balance) and closed at the end of each stage.
+Safety: every stage asserts the client's API hostnames are Binance Demo BEFORE
+any order is sent. A production hostname aborts the run. Orders are tiny and
+closed at the end of each stage.
 """
 
 import contextlib
@@ -19,9 +19,11 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
-load_dotenv()  # .env: BINANCE_API_KEY/SECRET (testnet spot), BINANCE_DEMO_API_KEY/SECRET (futures demo)
+load_dotenv()  # .env: Binance Demo credentials by default
 
-os.environ["TRADINGAGENTS_EXEC_SANDBOX"] = "true"
+os.environ["TRADINGAGENTS_EXEC_BASE_URL"] = os.environ.get(
+    "TRADINGAGENTS_EXEC_BASE_URL", "https://demo-api.binance.com"
+)
 os.environ["TRADINGAGENTS_EXEC_LIVE"] = "true"
 os.environ["TRADINGAGENTS_EXEC_AUTO_CONFIRM"] = "true"
 os.environ["TRADINGAGENTS_EXEC_DERIVATIVES"] = "true"
@@ -31,21 +33,19 @@ import ccxt  # noqa: E402
 from tradingagents.dataflows.config import get_config, set_config  # noqa: E402
 
 set_config({
-    "exec_sandbox": True,
+    "exec_base_url": "https://demo-api.binance.com",
     "exec_live": True,
     "exec_auto_confirm": True,
     "exec_derivatives": True,
-    "exec_log_path": str(__import__("pathlib").Path("server/data/testnet-flow-audit.jsonl")),
-    # The testnet account already holds ~72% of its equity in BTC from an
-    # earlier run, so default caps (2% per asset) rightly refuse any new Buy.
-    # This test RAISES the caps deliberately: it is testing the plumbing, not
-    # the risk limits (those have their own unit tests).
+    "exec_log_path": str(__import__("pathlib").Path("server/data/demo-flow-audit.jsonl")),
+    # Demo account already has most of its equity in BTC from an earlier run.
+    # This flow raises caps deliberately: it verifies execution plumbing, not risk limits.
     "risk_max_position_pct_per_asset": 90.0,
     "risk_max_daily_loss_pct": 50.0,
     "risk_max_total_exposure_pct": 100.0,
     "risk_max_derivatives_leverage": 3.0,
     "risk_max_derivatives_exposure_pct": 50.0,
-    "results_dir": str(__import__("pathlib").Path("server/data/testnet-results")),
+    "results_dir": str(__import__("pathlib").Path("server/data/demo-results")),
 })
 
 FAILURES: list[str] = []
@@ -58,20 +58,21 @@ def step(name: str, ok: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def assert_testnet(client: ccxt.Exchange, label: str) -> bool:
-    """Only the api urls matter — ccxt keeps doc/github urls on the main domain
-    even in sandbox mode (verified on ccxt 4.5.84)."""
+def assert_demo(client: ccxt.Exchange, label: str) -> bool:
+    """Only Binance Demo API hosts are allowed before any order is sent."""
     api = client.urls.get("api", {})
     watched = {
         key: api[key] for key in ("public", "private", "fapiPublic", "fapiPrivate")
         if key in api
     }
-    is_testnet = bool(watched) and all(
-        "testnet" in url or "binance.vision" in url for url in watched.values()
-    )
-    step(f"{label}: venue is testnet", is_testnet,
+    demo_hosts = {"demo-api.binance.com", "demo-fapi.binance.com"}
+    from urllib.parse import urlparse
+
+    hosts = {urlparse(url).hostname for url in watched.values()}
+    is_demo = bool(watched) and hosts.issubset(demo_hosts)
+    step(f"{label}: venue is Binance Demo", is_demo,
          ", ".join(f"{k}={v}" for k, v in watched.items())[:160])
-    return is_testnet
+    return is_demo
 
 
 def open_bracket_orders(exchange: ccxt.Exchange, symbol: str) -> list:
@@ -82,34 +83,33 @@ def open_bracket_orders(exchange: ccxt.Exchange, symbol: str) -> list:
 
 # ---------------------------------------------------------------- layer 1: spot
 def layer_spot() -> None:
-    print("\n=== LAYER 1: spot full path (live testnet, bracket) ===", flush=True)
+    print("\n=== LAYER 1: spot full path (live Binance Demo, bracket) ===", flush=True)
     from tradingagents.dataflows.screening import atr_targets
     from tradingagents.execution.bridge import ExchangeBridge
 
     bridge = ExchangeBridge(config=get_config())
     client = bridge.client()
     client.load_markets()
-    if not assert_testnet(client, "spot"):
+    if not assert_demo(client, "spot"):
         return
 
-    # pre-clean: cancel any open orders left by an earlier run, flatten BTC.
-    # A vanish (-2011 Unknown order) between list and cancel is fine — the
-    # goal is "no open orders", so tolerate it.
-    for order in client.fetch_open_orders("BTC/USDT"):
-        with contextlib.suppress(ccxt.OrderNotFound):
-            client.cancel_order(order["id"], "BTC/USDT")
-    pre_held = float((client.fetch_balance().get("free") or {}).get("BTC", 0) or 0)
-    if pre_held >= 0.00001:
-        client.create_order("BTC/USDT", "market", "sell",
-                            client.amount_to_precision("BTC/USDT", pre_held))
-        print(f"pre-clean: flattened {pre_held} BTC", flush=True)
+    existing_orders = client.fetch_open_orders("BTC/USDT")
+    pre_balance = client.fetch_balance()
+    pre_held = float((pre_balance.get("free") or {}).get("BTC", 0) or 0)
+    step(
+        "spot: Demo account is clear before test",
+        not existing_orders and pre_held < 0.00001,
+        f"open_orders={len(existing_orders)} BTC={pre_held:.8f}; refusing to touch pre-existing exposure",
+    )
+    if existing_orders or pre_held >= 0.00001:
+        return
 
     # plan_order's percentage caps need a real portfolio: build it from the
     # venue itself (same shape the autoloop passes to _handle_plan).
     portfolio = bridge.sync_portfolio()
     balance = client.fetch_balance()
     free = float((balance.get("free") or {}).get("USDT", 0) or 0)
-    step("spot: testnet balance readable", free > 0, f"free USDT={free:.2f}")
+    step("spot: Demo balance readable", free > 0, f"free USDT={free:.2f}")
     if free <= 0:
         return
 
@@ -131,11 +131,9 @@ def layer_spot() -> None:
          f"SL={stop} TP={take}" if stop and take else "ATR unavailable")
 
     order_id = bridge.execute_order(plan, confirm=True)
-    step("spot: live fill on testnet", bool(order_id), f"order_id={order_id}")
+    step("spot: live fill on Binance Demo", bool(order_id), f"order_id={order_id}")
 
-    # The OCO is one order LIST: the LIMIT_MAKER TP leg has no trigger field,
-    # so count ALL open orders on the symbol (pre-clean guarantees they're
-    # only ours) — both legs must be resting on the venue.
+    # The preflight guarantees these are the flow's own OCO legs.
     orders = client.fetch_open_orders("BTC/USDT")
     step("spot: OCO bracket live on venue (both legs)", len(orders) >= 2,
          f"{len(orders)} open order(s): "
@@ -159,34 +157,14 @@ def layer_spot() -> None:
 
 # ------------------------------------------------------------- layer 2: futures
 def layer_futures() -> None:
-    """SKIPPED unless demo credentials exist: Binance demo trading (demo-
-    fapi.binance.com) rejects the regular testnet API keys with 401 — a demo
-    key must be created at demo.binance.com and placed in BINANCE_DEMO_API_KEY
-    / BINANCE_DEMO_SECRET. Everything below runs when those are present."""
-    print("\n=== LAYER 2: futures full path (Binance demo, reduceOnly) ===", flush=True)
-    demo_key = os.environ.get("BINANCE_DEMO_API_KEY")
-    demo_secret = os.environ.get("BINANCE_DEMO_SECRET")
-    if not demo_key or not demo_secret:
-        step("futures: layer SKIPPED — needs demo API keys", True,
-             "demo-fapi rejects regular testnet keys (401). Tạo key tại "
-             "demo.binance.com rồi đặt BINANCE_DEMO_API_KEY/BINANCE_DEMO_SECRET.")
-        return
+    """Run futures through the same URL-selected Demo credentials as spot."""
+    print("\n=== LAYER 2: futures full path (Binance Demo, reduceOnly) ===", flush=True)
     from tradingagents.execution.derivatives import DerivativesExecutor
 
-    # exec_sandbox must be OFF here: ccxt forbids demo trading while sandbox
-    # mode is enabled (they are mutually exclusive on one client). The gate
-    # reads the env at call time, so scope the override to this layer.
-    os.environ.pop("TRADINGAGENTS_EXEC_SANDBOX", None)
-    config = {**get_config(), "exec_sandbox": False}
+    config = {**get_config(), "exec_base_url": "https://demo-api.binance.com"}
     executor = DerivativesExecutor(config=config)
     client = executor._bridge.client()
-    client.apiKey = demo_key
-    client.secret = demo_secret
     client.options["defaultType"] = "swap"
-    # ccxt 4.5.x removed Binance futures testnet (sign() raises NotSupported:
-    # "testnet/sandbox mode is not supported for futures anymore"); demo
-    # trading on demo-issued keys is the supported non-live venue.
-    client.enable_demo_trading(True)
     try:
         client.load_markets()
     except Exception as exc:
@@ -194,24 +172,46 @@ def layer_futures() -> None:
         return
     api = client.urls.get("api", {})
     watched = {k: api[k] for k in ("fapiPublic", "fapiPrivate") if k in api}
-    is_demo = bool(watched) and all(
-        "demo" in url or "testnet" in url for url in watched.values()
-    )
-    step("futures: venue is demo (not live)", is_demo,
+    demo_hosts = {"demo-api.binance.com", "demo-fapi.binance.com"}
+    from urllib.parse import urlparse
+
+    hosts = {urlparse(url).hostname for url in watched.values()}
+    is_demo = bool(watched) and hosts.issubset(demo_hosts)
+    step("futures: venue is Binance Demo", is_demo,
          ", ".join(f"{k}={v}" for k, v in watched.items())[:140])
     if not is_demo:
         return
 
     symbol = executor.symbol_for("BTC-USD")
+    market_id = client.market_id(symbol)
+    existing_positions = client.fetch_positions([symbol])
+    open_positions = [p for p in existing_positions if abs(float(p.get("contracts") or 0)) > 0]
+    existing_orders = client.fetch_open_orders(symbol)
+    existing_algo = client.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+    existing_algo = existing_algo if isinstance(existing_algo, list) else existing_algo.get("orders", [])
+    clean = not open_positions and not existing_orders and not existing_algo
+    step(
+        "futures: Demo account is clear before test",
+        clean,
+        f"positions={len(open_positions)} orders={len(existing_orders)} algo={len(existing_algo)}; refusing to touch pre-existing exposure",
+    )
+    if not clean:
+        return
+
     balance = client.fetch_balance()
     free = float((balance.get("free") or {}).get("USDT", 0) or 0)
-    step("futures: demo balance readable", free > 0, f"free USDT={free:.2f} symbol={symbol}")
+    step("futures: Demo balance readable", free > 0, f"free USDT={free:.2f} symbol={symbol}")
     if free <= 0:
         return
 
     price = float(client.fetch_ticker(symbol)["last"])
     portfolio = executor._bridge.sync_portfolio()
-    plan = executor.plan_order("BTC-USD", "Buy", portfolio, price=price, leverage=2.0)
+    stop_loss = round(price * 0.97, 2)
+    take_profit = round(price * 1.03, 2)
+    plan = executor.plan_order(
+        "BTC-USD", "Buy", portfolio, price=price, leverage=2.0,
+        stop_loss=stop_loss, take_profit=take_profit,
+    )
     step("futures: plan_order sizes a leveraged long",
          plan.side == "buy" and plan.market == "derivatives" and (plan.quantity or 0) > 0,
          f"side={plan.side} qty={plan.quantity} leverage={plan.leverage}")
@@ -219,8 +219,8 @@ def layer_futures() -> None:
         step("futures: plan refusal reason", False, str(plan.reason)[:160])
         return
     plan = plan.model_copy(update={
-        "stop_loss": round(price * 0.97, 2),
-        "take_profit": round(price * 1.03, 2),
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
     })
     order_id = executor.execute_order(plan, confirm=True, portfolio=portfolio)
     step("futures: live leveraged fill on demo venue", bool(order_id), f"order_id={order_id}")
@@ -247,6 +247,8 @@ def layer_futures() -> None:
         client.create_order(symbol, "market", "sell",
                             client.amount_to_precision(symbol, live[0]["contracts"]),
                             params={"reduceOnly": True})
+    # These are the only Algo orders on the symbol because the preflight
+    # refuses to run with existing positions/orders.
     for order in algo_orders:
         with contextlib.suppress(Exception):
             client.fapiPrivateDeleteAlgoOrder({"symbol": market_id,
@@ -258,9 +260,15 @@ def layer_futures() -> None:
     remaining = [p for p in positions if abs(float(p.get("contracts") or 0)) > 0]
     leftover_algo = client.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
     leftover = leftover_algo if isinstance(leftover_algo, list) else leftover_algo.get("orders", [])
-    step("futures: cleanup flattened the position",
-         len(remaining) == 0 and len(leftover) == 0,
+    flattened = len(remaining) == 0 and len(leftover) == 0
+    step("futures: cleanup flattened the position", flattened,
          f"positions left={len(remaining)}, algo orders left={len(leftover)}")
+    if flattened:
+        from server import job_store
+
+        state_key = f"{symbol}:buy:{order_id}"
+        state_cleared = job_store.delete_position_state(state_key)
+        step("futures: durable position state cleared", state_cleared, state_key)
 
 
 if __name__ == "__main__":

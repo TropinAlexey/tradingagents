@@ -60,6 +60,20 @@ function lastCycleSummary(cycle: AutoloopLastCycle): string {
   if (cycle.status === "failed") {
     return `${when} · Thất bại — ${cycle.error ?? "lỗi không xác định"}`;
   }
+  if (cycle.status === "running" || cycle.status === "timeout") {
+    const telemetry = cycle.telemetry;
+    const ticker = telemetry?.active_ticker ?? telemetry?.current_ticker;
+    const stage = telemetry?.active_stage ?? telemetry?.last_stage;
+    const progress = [
+      ticker ? `Mã: ${ticker}` : null,
+      telemetry?.active_node ? `Agent: ${telemetry.active_node}` : null,
+      stage ? `${telemetry?.active_stage ? "Bước" : "Bước gần nhất"}: ${stage}` : null,
+    ].filter(Boolean).join(" · ");
+    const status = cycle.status === "running"
+      ? "Đang chạy"
+      : `Hết thời gian — ${cycle.error ?? "vượt quá thời gian chờ"}`;
+    return `${when} · ${status}${progress ? ` · ${progress}` : ""}`;
+  }
   const executed = cycle.results.filter((result) => result.executed).length;
   const candidates =
     cycle.candidates.length > 0 ? `Ứng viên: ${cycle.candidates.join(", ")}` : "Không có ứng viên";
