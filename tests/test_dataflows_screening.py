@@ -190,7 +190,23 @@ def test_crypto_universe_via_module_seam(monkeypatch):
         symbols = ["BTC/USDT", "USDC/USDT", "DOGE/USDT", "ZEC/USDT", "ETH/BTC"]
 
         def __init__(self, config):
-            pass
+            self.demo_enabled = False
+            self.urls = {
+                "api": {
+                    "public": "https://api.binance.com/api/v3",
+                    "private": "https://api.binance.com/api/v3",
+                    "fapiPublic": "https://fapi.binance.com/fapi/v1",
+                    "fapiPrivate": "https://fapi.binance.com/fapi/v1",
+                }
+            }
+
+        def enable_demo_trading(self, enabled):
+            self.demo_enabled = enabled
+            self.urls["api"] = {
+                key: value.replace("https://api.binance.com", "https://demo-api.binance.com")
+                .replace("https://fapi.binance.com", "https://demo-fapi.binance.com")
+                for key, value in self.urls["api"].items()
+            }
 
         def market(self, symbol):
             return {"base": symbol.split("/", 1)[0]}
@@ -207,8 +223,38 @@ def test_crypto_universe_via_module_seam(monkeypatch):
     fake_ccxt = types.SimpleNamespace(binance=FakeExchange)
     monkeypatch.setitem(sys.modules, "ccxt", fake_ccxt)
 
-    universe = screening.crypto_universe({"exec_exchange_id": "binance"}, top_n=5)
+    universe = screening.crypto_universe(
+        {"exec_exchange_id": "binance", "exec_base_url": "https://demo-api.binance.com"},
+        top_n=5,
+    )
+    exchange = screening._public_exchange(
+        {"exec_exchange_id": "binance", "exec_base_url": "https://demo-api.binance.com"}
+    )
+    assert exchange.demo_enabled is True
+    assert exchange.urls["api"]["public"].startswith("https://demo-api.binance.com/")
     assert universe == ["BTC-USD", "DOGE-USD"]  # stablecoin dropped, thin dropped, non-USDT dropped
+
+
+def test_crypto_universe_uses_production_only_when_configured(monkeypatch):
+    import sys
+    import types
+
+    class FakeExchange:
+        def __init__(self, config):
+            self.demo_enabled = False
+            self.urls = {"api": {"public": "https://api.binance.com/api/v3"}}
+
+        def fetch_tickers(self):
+            return {}
+
+    monkeypatch.setitem(sys.modules, "ccxt", types.SimpleNamespace(binance=FakeExchange))
+
+    exchange = screening._public_exchange(
+        {"exec_exchange_id": "binance", "exec_base_url": "https://api.binance.com"}
+    )
+
+    assert exchange.demo_enabled is False
+    assert exchange.urls["api"]["public"].startswith("https://api.binance.com/")
 
 
 def test_crypto_universe_failure_raises_vendor_error(monkeypatch):

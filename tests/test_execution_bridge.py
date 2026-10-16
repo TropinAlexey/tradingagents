@@ -482,7 +482,7 @@ def test_live_without_credentials_is_denied(tmp_path, monkeypatch):
     exchange = FakeExchange(api_key="", secret="")
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    with pytest.raises(RuntimeError, match="BINANCE_API_KEY"):
+    with pytest.raises(RuntimeError, match="BINANCE_DEMO_API_KEY"):
         bridge.execute_order(order, confirm=True)
     assert not any(call[0] == "create_order" for call in exchange.calls)
     assert read_audit(tmp_path)[-1]["action"] == "execute_denied"
@@ -667,7 +667,7 @@ def test_custom_factory_client_is_the_one_used(tmp_path, monkeypatch):
     assert sentinel.calls  # the injected fake served the live path
 
 
-def test_default_factory_reads_credentials_from_env(monkeypatch):
+def test_default_factory_reads_production_credentials_from_env(monkeypatch):
     monkeypatch.setenv("BINANCE_API_KEY", "env-key")
     monkeypatch.setenv("BINANCE_SECRET", "env-secret")
     import tradingagents.execution.bridge as bridge_module
@@ -679,33 +679,94 @@ def test_default_factory_reads_credentials_from_env(monkeypatch):
             captured.update(options)
             self.apiKey = options["apiKey"]
             self.secret = options["secret"]
+            self.urls = {"api": {
+                "public": "https://api.binance.com/api/v3",
+                "private": "https://api.binance.com/api/v3",
+                "fapiPublic": "https://fapi.binance.com/fapi/v1",
+                "fapiPrivate": "https://fapi.binance.com/fapi/v1",
+            }}
 
     monkeypatch.setattr(ccxt, "binance", FakeBinance)
-    bridge_module._default_exchange_factory("binance")
+    bridge_module._default_exchange_factory(
+        "binance", base_url="https://api.binance.com"
+    )
     assert captured == {"apiKey": "env-key", "secret": "env-secret", "enableRateLimit": True}
 
 
-def test_default_factory_sandbox_routes_to_testnet(monkeypatch):
-    # exec_sandbox=True must reach ccxt's set_sandbox_mode(True) -- testnet
-    # credentials only authenticate there, never on production. The default
-    # (False) must not call it at all.
+def test_default_factory_demo_uses_demo_credentials(monkeypatch):
+    import tradingagents.execution.bridge as bridge_module
+
+    captured = {}
+
+    class FakeBinance(ccxt.Exchange):
+        def __init__(self, options):
+            captured.update(options)
+            self.urls = {"api": {
+                "public": "https://api.binance.com/api/v3",
+                "private": "https://api.binance.com/api/v3",
+                "fapiPublic": "https://fapi.binance.com/fapi/v1",
+                "fapiPrivate": "https://fapi.binance.com/fapi/v1",
+            }}
+
+        def enable_demo_trading(self, enabled):
+            self.urls["api"] = {
+                key: value.replace("https://api.binance.com", "https://demo-api.binance.com")
+                .replace("https://fapi.binance.com", "https://demo-fapi.binance.com")
+                for key, value in self.urls["api"].items()
+            }
+
+    monkeypatch.setenv("BINANCE_API_KEY", "wrong-key")
+    monkeypatch.setenv("BINANCE_SECRET", "wrong-secret")
+    monkeypatch.setenv("BINANCE_DEMO_API_KEY", "demo-key")
+    monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret")
+    monkeypatch.setattr(ccxt, "binance", FakeBinance)
+
+    bridge_module._default_exchange_factory("binance", sandbox=True)
+
+    assert captured["apiKey"] == "demo-key"
+    assert captured["secret"] == "demo-secret"
+
+
+def test_default_factory_demo_routes_to_demo_api(monkeypatch):
+    """Sandbox binance must arm Demo Trading (its own demo endpoint), never
+    fall back to Spot Testnet."""
     import tradingagents.execution.bridge as bridge_module
 
     calls = []
 
     class FakeBinance(ccxt.Exchange):
         def __init__(self, options):
+            self.urls = {"api": "https://api.binance.com/api/v3", "demo": "https://demo-api.binance.com/api/v3"}
+
+        def enable_demo_trading(self, enabled):
+            calls.append((enabled, self.urls["demo"]))
+            self.urls["api"] = self.urls["demo"]
+
+        def set_sandbox_mode(self, enabled):
+            raise AssertionError("Binance demo mode must not use Spot Testnet")
+
+    monkeypatch.setenv("BINANCE_DEMO_API_KEY", "demo-key")
+    monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret")
+    monkeypatch.setattr(ccxt, "binance", FakeBinance)
+    bridge_module._default_exchange_factory("binance", sandbox=True)
+    assert calls == [(True, "https://demo-api.binance.com/api/v3")]
+
+
+def test_default_factory_sandbox_routes_other_exchange_to_sandbox(monkeypatch):
+    import tradingagents.execution.bridge as bridge_module
+
+    calls = []
+
+    class FakeOkx(ccxt.Exchange):
+        def __init__(self, options):
             pass
 
         def set_sandbox_mode(self, enabled):
             calls.append(enabled)
 
-    monkeypatch.setattr(ccxt, "binance", FakeBinance)
-    client = bridge_module._default_exchange_factory("binance", sandbox=True)
-    assert isinstance(client, FakeBinance)
+    monkeypatch.setattr(ccxt, "okx", FakeOkx)
+    bridge_module._default_exchange_factory("okx", sandbox=True)
     assert calls == [True]
-    bridge_module._default_exchange_factory("binance")
-    assert calls == [True]  # unchanged: default stays on production
 
 
 def test_bridge_wires_exec_sandbox_into_default_factory(tmp_path, monkeypatch):
@@ -716,10 +777,20 @@ def test_bridge_wires_exec_sandbox_into_default_factory(tmp_path, monkeypatch):
 
     class FakeBinance(ccxt.Exchange):
         def __init__(self, options):
-            pass
+            self.urls = {"api": {
+                "public": "https://api.binance.com/api/v3",
+                "private": "https://api.binance.com/api/v3",
+                "fapiPublic": "https://fapi.binance.com/fapi/v1",
+                "fapiPrivate": "https://fapi.binance.com/fapi/v1",
+            }}
 
-        def set_sandbox_mode(self, enabled):
+        def enable_demo_trading(self, enabled):
             calls.append(enabled)
+            self.urls["api"] = {
+                key: value.replace("https://api.binance.com", "https://demo-api.binance.com")
+                .replace("https://fapi.binance.com", "https://demo-fapi.binance.com")
+                for key, value in self.urls["api"].items()
+            }
 
     monkeypatch.setattr(ccxt, "binance", FakeBinance)
     bridge = ExchangeBridge(
@@ -732,7 +803,7 @@ def test_bridge_wires_exec_sandbox_into_default_factory(tmp_path, monkeypatch):
     assert calls == [True]
     plain = ExchangeBridge(config={"exec_log_path": str(tmp_path / "audit2.jsonl")})
     plain._exchange_or_raise()
-    assert calls == [True]  # default bridge stays on production
+    assert calls == [True, True]  # default bridge is Demo by default
 
 
 def test_default_factory_selects_exchange_class_by_id(monkeypatch):
@@ -1144,3 +1215,101 @@ def test_planned_order_carries_no_precision_string():
     assert order.side is None
     assert order.needs_review is False
     assert order.mode == "dry"
+
+# --- futures symbol resolver (FR-D) -----------------------------------------
+
+def _futures_markets():
+    return {
+        "BTC/USDT:USDT": {
+            "base": "BTC", "quote": "USDT", "settle": "USDT",
+            "contract": True, "swap": True, "type": "swap", "active": True,
+        },
+        "BTC/USDC:USDC": {
+            "base": "BTC", "quote": "USDC", "settle": "USDC",
+            "contract": True, "swap": True, "type": "swap", "active": True,
+        },
+        "NEAR/USDT:USDT": {
+            "base": "NEAR", "quote": "USDT", "settle": "USDT",
+            "contract": True, "swap": True, "type": "swap", "active": True,
+        },
+        "ETH/USD:USD": {
+            "base": "ETH", "quote": "USD", "settle": "USD",
+            "contract": True, "swap": True, "type": "future", "active": True,
+        },
+        "BTC/USDT": {"base": "BTC", "quote": "USDT", "type": "spot", "active": True},
+        "XRP/USDT:USDT": {
+            "base": "XRP", "quote": "USDT", "settle": "USDT",
+            "contract": True, "swap": True, "type": "swap", "active": False,
+        },
+    }
+
+
+def test_futures_symbol_for_returns_the_metadata_unified_symbol(tmp_path, monkeypatch):
+    """The resolver returns the venue's own unified key -- never a locally
+    synthesized symbol -- including bases outside the spot closed set."""
+    bridge = make_bridge(tmp_path, monkeypatch)
+    assert bridge.futures_symbol_for("NEAR-USD", markets=_futures_markets()) == "NEAR/USDT:USDT"
+    assert bridge.futures_symbol_for("BTC-USD", markets=_futures_markets()) == "BTC/USDT:USDT"
+    usd = make_bridge(tmp_path, monkeypatch, config={"exec_quote_currency": "USD"})
+    assert usd.futures_symbol_for("ETH-USD", markets=_futures_markets()) == "ETH/USD:USD"
+
+
+def test_futures_symbol_for_rejects_spot_only_and_missing_markets(tmp_path, monkeypatch):
+    bridge = make_bridge(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="no active USDT-settled futures contract"):
+        bridge.futures_symbol_for("SOL-USD", markets={"SOL/USDT": {"base": "SOL", "quote": "USDT", "type": "spot", "active": True}})
+    with pytest.raises(ValueError, match="no active USDT-settled futures contract"):
+        bridge.futures_symbol_for("BTC-USD", markets={})
+
+
+def test_futures_symbol_for_rejects_inactive_and_wrong_settle(tmp_path, monkeypatch):
+    bridge = make_bridge(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="no active USDT-settled futures contract"):
+        bridge.futures_symbol_for("XRP-USD", markets=_futures_markets())  # active=False
+    with pytest.raises(ValueError, match="no active USDT-settled futures contract"):
+        bridge.futures_symbol_for("DOGE-USD", markets={
+            "DOGE/USDC:USDC": {
+                "base": "DOGE", "quote": "USDC", "settle": "USDC",
+                "contract": True, "swap": True, "type": "swap", "active": True,
+            },
+        })
+
+
+def test_futures_symbol_for_rejects_malformed_override_before_any_venue_call(tmp_path, monkeypatch):
+    bridge = make_bridge(
+        tmp_path, monkeypatch,
+        config={"exec_symbol_overrides": {"BTC-USD": "BTCUSDT"}},  # not BASE/QUOTE:SETTLE
+    )
+    with pytest.raises(ValueError, match="not a valid unified futures symbol"):
+        bridge.futures_symbol_for("BTC-USD")
+    assert bridge._exchange is None  # refused before any client was built
+
+
+def test_futures_symbol_for_override_still_passes_metadata_validation(tmp_path, monkeypatch):
+    """An override is only a pointer: a USDC-settled market can never satisfy
+    a USDT quote contract."""
+    bridge = make_bridge(
+        tmp_path, monkeypatch,
+        config={"exec_symbol_overrides": {"BTC-USD": "BTC/USDC:USDC"}},
+    )
+    with pytest.raises(ValueError, match="no active USDT-settled futures contract"):
+        bridge.futures_symbol_for("BTC-USD", markets=_futures_markets())
+
+
+def test_derivatives_gates_closed_plan_order_never_touches_the_exchange(tmp_path, monkeypatch):
+    """Rescue scenario: with the derivatives gates closed, plan_order refuses
+    BEFORE resolving the venue, so the exchange client is never even built --
+    load_markets (and every other venue call) can never fire."""
+    from tradingagents.execution.derivatives import DerivativesExecutor
+
+    exchange = FakeExchange()
+    executor = DerivativesExecutor(
+        config={"exec_log_path": str(tmp_path / "deriv-audit.jsonl")},
+        exchange_factory=lambda: exchange,
+    )
+    with pytest.raises(PermissionError, match="exec_derivatives"):
+        executor.plan_order(
+            "BTC-USD", "Buy", buy_book(), price=50_000.0,
+            stop_loss=48_000.0, take_profit=55_000.0,
+        )
+    assert exchange.calls == []  # not even load_markets: the refusal precedes resolution

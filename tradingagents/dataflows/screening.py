@@ -98,6 +98,28 @@ class Candidate:
         }
 
 
+def _public_exchange(config: dict):
+    """Build the screening client from the same Binance venue profile as execution."""
+    exchange_id = str(config.get("exec_exchange_id") or "binance").strip().lower()
+    import ccxt  # lazy like bridge.py: importing dataflows stays cheap
+
+    exchange_class = getattr(ccxt, exchange_id, None)
+    if not isinstance(exchange_class, type):
+        raise VendorError(f"crypto universe unavailable via {exchange_id}: unsupported exchange")
+    exchange = exchange_class({"enableRateLimit": True})
+    if exchange_id == "binance":
+        base_url = str(config.get("exec_base_url") or "https://demo-api.binance.com")
+        from tradingagents.execution.bridge import _binance_profile
+
+        profile = _binance_profile(base_url)
+        if profile == "demo":
+            enable_demo_trading = getattr(exchange, "enable_demo_trading", None)
+            if not callable(enable_demo_trading):
+                raise VendorError("crypto universe unavailable via binance: Demo Trading is unsupported")
+            enable_demo_trading(True)
+    return exchange
+
+
 def crypto_universe(config: dict, top_n: int) -> list[str]:
     """Top ``top_n`` liquid crypto as pipeline tickers (``BTC-USD`` form).
 
@@ -108,11 +130,10 @@ def crypto_universe(config: dict, top_n: int) -> list[str]:
     ``BASE-USD`` and the bridge plans through ``exec_symbol_overrides`` if one
     of them ever earns a plan.
     """
-    exchange_id = str(config.get("exec_exchange_id") or "binance")
-    import ccxt  # lazy like bridge.py: importing dataflows stays cheap
+    exchange_id = str(config.get("exec_exchange_id") or "binance").strip().lower()
 
     try:
-        exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+        exchange = _public_exchange(config)
         tickers = exchange.fetch_tickers()
     except Exception as exc:  # noqa: BLE001 — any ccxt/network failure degrades
         raise VendorError(f"crypto universe unavailable via {exchange_id}: {exc}") from exc

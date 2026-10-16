@@ -103,8 +103,10 @@ def _server_state(tmp_path, monkeypatch):
     monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
     monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
     monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
+    monkeypatch.setattr(server_paths, "OPERATOR_CONFIG_PATH", tmp_path / "operator_config.json")
     monkeypatch.setattr(runs_mod, "_runs", {})
     monkeypatch.setattr(daily_mod, "_jobs", {})
+    set_config({"exec_live": False})
     yield
     DEFAULT_CONFIG["exec_watchlist"] = saved_watchlist
 
@@ -150,6 +152,8 @@ def test_settings_get_masks_credentials_and_lists_paths(client, monkeypatch):
     # reports configured/masked, so blank them here to make the assert exact.
     monkeypatch.delenv("BINANCE_API_KEY", raising=False)
     monkeypatch.delenv("BINANCE_SECRET", raising=False)
+    monkeypatch.delenv("BINANCE_DEMO_API_KEY", raising=False)
+    monkeypatch.delenv("BINANCE_DEMO_SECRET", raising=False)
     response = client.get("/api/settings")
     assert response.status_code == 200
     body = response.json()
@@ -158,16 +162,18 @@ def test_settings_get_masks_credentials_and_lists_paths(client, monkeypatch):
     readonly = {row["key"] for row in body["settings"] if not row["editable"]}
     # Contract §1 prose says "24 rows" but its own list — and the file — have 25
     # (_ENV_OVERRIDES, default_config.py:10-53). The mapping is authoritative.
-    assert len(editable) == len(_ENV_OVERRIDES)
+    assert len(editable) == len(_ENV_OVERRIDES) - 1
     assert "llm_provider" in {row["key"] for row in editable}
-    assert readonly == {"results_dir", "data_cache_dir", "memory_log_path", "exec_log_path"}
+    assert readonly == {
+        "results_dir", "data_cache_dir", "memory_log_path", "exec_log_path", "exec_base_url",
+    }
 
     credentials = {item["env_var"]: item for item in body["credentials"]}
     assert credentials["OPENAI_API_KEY"]["configured"] is True
     assert credentials["OPENAI_API_KEY"]["masked"].endswith("1234")
     assert "sk-test-abcd" not in response.text  # never the raw key
-    assert credentials["BINANCE_API_KEY"]["configured"] is False
-    assert credentials["BINANCE_API_KEY"]["masked"] is None
+    assert credentials["BINANCE_DEMO_API_KEY"]["configured"] is False
+    assert credentials["BINANCE_DEMO_API_KEY"]["masked"] is None
 
     assert body["gates_readonly"]["exec_live_config"] is False
     assert body["effective_exec_mode"] == "dry"
@@ -194,6 +200,32 @@ def test_settings_put_forbids_gate_and_unknown_keys(client):
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "forbidden_key"
     assert get_config()["exec_live"] is False  # the FR5 config gate never moves via API
+
+
+def test_settings_credentials_follow_binance_venue_url(client, monkeypatch):
+    set_config({"exec_base_url": "https://api.binance.com"})
+    monkeypatch.setenv("BINANCE_API_KEY", "prod-key-1234")
+    monkeypatch.setenv("BINANCE_SECRET", "prod-secret-5678")
+    monkeypatch.setenv("BINANCE_DEMO_API_KEY", "demo-key-9999")
+    monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret-0000")
+
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    body = response.json()
+    credential_vars = {item["env_var"] for item in body["credentials"]}
+    assert "BINANCE_API_KEY" in credential_vars
+    assert "BINANCE_SECRET" in credential_vars
+    assert "BINANCE_DEMO_API_KEY" not in credential_vars
+    assert "prod-key-1234" not in response.text
+    assert "demo-key-9999" not in response.text
+
+
+def test_settings_put_forbids_venue_url_switch(client):
+    response = client.put(
+        "/api/settings", json={"settings": {"exec_base_url": "https://api.binance.com"}}
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden_key"
 
 
 def test_settings_put_coercion_error_names_env_var(client):
@@ -258,6 +290,10 @@ def test_watchlist_add_delete_roundtrip(client):
 
     empty = client.post("/api/watchlist", json={"symbol": "   "})
     assert empty.status_code == 400
+
+    malformed = client.post("/api/watchlist", json={"symbol": "MOVR-USD, LITE"})
+    assert malformed.status_code == 400
+    assert malformed.json()["error"]["code"] == "validation_error"
 
     removed = client.delete("/api/watchlist/sol-usd", headers=_JSON)
     assert removed.status_code == 200
@@ -640,6 +676,24 @@ def test_approve_execute_failed_when_guard_refuses(client, tmp_path, monkeypatch
     assert "risk guard refused execution" in stored["resolution"]
     engine_log = (tmp_path / "engine-audit.jsonl").read_text(encoding="utf-8")
     assert '"action": "rejected_by_risk"' in engine_log
+
+
+def test_approve_venue_portfolio_failure_stays_pending(client, monkeypatch):
+    set_config({"exec_live": True})
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
+
+    class _DeadVenue(_FakeExchange):
+        def fetch_balance(self):
+            raise RuntimeError("exchangeInfo 502 Bad Gateway")
+
+    _inject_bridge(monkeypatch, _DeadVenue())
+    item = _enqueue()
+
+    response = client.post(f"/api/approvals/{item['id']}/approve", json={})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "exchange_unreachable"
+    assert approvals_mod._load_items()[0]["status"] == "pending"
 
 
 def test_approve_exchange_failure_marks_execute_failed(client, tmp_path, monkeypatch):

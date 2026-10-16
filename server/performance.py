@@ -28,16 +28,15 @@ RECENT_ORDERS_LIMIT = 50  # newest execute lines the board shows
 
 _QTY_EPSILON = 1e-12  # mirrors risk.py's tolerance for float leftovers
 
-# Lazy venue behind the default mark. Kept between requests and rebuilt when
-# the configured venue changes, so a settings PUT to exec_exchange_id never
-# leaves marks coming from the old exchange.
+# Lazy venue behind the default mark. Rebuilt whenever its exchange, URL, or
+# non-Binance sandbox setting changes.
 _default_bridge = None
-_default_bridge_venue: tuple[str, bool] | None = None
+_default_bridge_venue: tuple[str, str, bool] | None = None
 
 
 @dataclass
 class _OpenLot:
-    """One unmatched buy fill; FIFO leftovers are reported per lot."""
+    """One unmatched signed fill; positive quantity is long, negative short."""
 
     ticker: str
     qty: float
@@ -57,7 +56,11 @@ def _default_price_fetcher(ticker: str) -> float | None:
     global _default_bridge, _default_bridge_venue
     try:
         config = get_config()
-        venue = (str(config.get("exec_exchange_id")), config.get("exec_sandbox") is True)
+        venue = (
+            str(config.get("exec_exchange_id")),
+            str(config.get("exec_base_url") or ""),
+            config.get("exec_sandbox") is True,
+        )
         if _default_bridge is None or _default_bridge_venue != venue:
             from tradingagents.execution.bridge import ExchangeBridge
 
@@ -82,34 +85,48 @@ def _is_fill(event: dict) -> bool:
 
 
 def _replay_fills(fills: list[dict]) -> tuple[list[float], list[_OpenLot]]:
-    """Long-only FIFO per ticker.
+    """FIFO replay per ticker with derivatives short support.
 
-    A buy opens a lot, a sell closes lots oldest first, and every lot-match
-    is one closed round-trip whose return is ``(sell / buy - 1) * 100``. A
-    sell with no open lot has no basis in a long-only book and is dropped —
-    the same stance as risk.py's unknown-basis closes. Returns the closed
-    round-trip returns (in close order) and the open lots in entry order.
+    Positive lots are long. Derivatives sells can open negative short lots;
+    later buys cover them. Spot sells without a long basis remain unknown and
+    are intentionally dropped.
     """
     open_lots: dict[str, deque[_OpenLot]] = defaultdict(deque)
     closed_pnls: list[float] = []
     for event in fills:
         ticker = event["ticker"]
         qty, price = float(event["qty"]), float(event["price_est"])
+        derivatives = event.get("market") == "derivatives"
         if event["action"] == "buy":
-            open_lots[ticker].append(_OpenLot(
-                ticker=ticker, qty=qty, price=price,
-                mode=event.get("mode"), entry_at=event.get("timestamp"),
-            ))
+            remaining = qty
+            while remaining > _QTY_EPSILON and open_lots[ticker] and open_lots[ticker][0].qty < 0:
+                lot = open_lots[ticker][0]
+                matched = min(remaining, -lot.qty)
+                closed_pnls.append((lot.price - price) / lot.price * 100)
+                lot.qty += matched
+                remaining -= matched
+                if -lot.qty <= _QTY_EPSILON:
+                    open_lots[ticker].popleft()
+            if remaining > _QTY_EPSILON:
+                open_lots[ticker].append(_OpenLot(
+                    ticker=ticker, qty=remaining, price=price,
+                    mode=event.get("mode"), entry_at=event.get("timestamp"),
+                ))
             continue
         remaining = qty
-        while remaining > _QTY_EPSILON and open_lots[ticker]:
+        while remaining > _QTY_EPSILON and open_lots[ticker] and open_lots[ticker][0].qty > 0:
             lot = open_lots[ticker][0]
             matched = min(lot.qty, remaining)
-            closed_pnls.append((price / lot.price - 1) * 100)
+            closed_pnls.append((price - lot.price) / lot.price * 100)
             lot.qty -= matched
             remaining -= matched
             if lot.qty <= _QTY_EPSILON:
                 open_lots[ticker].popleft()
+        if derivatives and remaining > _QTY_EPSILON:
+            open_lots[ticker].append(_OpenLot(
+                ticker=ticker, qty=-remaining, price=price,
+                mode=event.get("mode"), entry_at=event.get("timestamp"),
+            ))
     return closed_pnls, [lot for lots in open_lots.values() for lot in lots]
 
 
@@ -133,8 +150,7 @@ def _summarize(closed_pnls: list[float]) -> dict:
 def _open_position_rows(
     open_lots: list[_OpenLot], fetch: Callable[[str], float | None]
 ) -> list[dict]:
-    """One row per unmatched buy lot, marked through the price seam (each
-    ticker is fetched once per call)."""
+    """One row per unmatched signed lot, marked through the price seam."""
     marks: dict[str, float | None] = {}
     rows: list[dict] = []
     for lot in open_lots:
@@ -146,7 +162,10 @@ def _open_position_rows(
             "qty": lot.qty,
             "entry_price": lot.price,
             "current_price": current,
-            "unrealized_pct": (current / lot.price - 1) * 100 if current is not None else None,
+            "unrealized_pct": (
+                (current / lot.price - 1) * 100 if lot.qty > 0
+                else (lot.price - current) / lot.price * 100
+            ) if current is not None and current > 0 else None,
             "mode": lot.mode,
             "entry_at": lot.entry_at,
         })

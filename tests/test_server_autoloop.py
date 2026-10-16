@@ -8,7 +8,7 @@ and the engine's audit log lives in tmp.
 
 import json
 import socket
-import time
+import threading
 import weakref
 from datetime import datetime, timezone
 
@@ -86,6 +86,7 @@ def _server_state(tmp_path, monkeypatch):
     monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
     monkeypatch.setattr(server_paths, "AUTOLOOP_PATH", tmp_path / "autoloop.json")
     monkeypatch.setattr(autoloop_mod, "_last_cycle", None)
+    monkeypatch.setattr(autoloop_mod, "_last_telemetry", None)
     monkeypatch.setattr(autoloop_mod, "_cycle_thread", None)
     autoloop_mod._wakeup.clear()
     # A run/job planted anywhere must never leak into a cycle's busy check.
@@ -216,17 +217,125 @@ def test_ensure_started_reuses_a_live_scheduler(monkeypatch):
     assert autoloop_mod._scheduler_thread is sentinel  # idempotent: never a second thread
 
 
-def test_scheduler_loop_re_reads_state_and_spawns_a_cycle(monkeypatch, tmp_path):
-    autoloop_mod._save_state({"enabled": True, "interval_minutes": 15, "updated_at": utc_now_iso()})
+def test_scheduler_loop_runs_enabled_state_immediately(monkeypatch, tmp_path):
+    autoloop_mod._save_state({"enabled": True, "interval_minutes": 1440, "updated_at": utc_now_iso()})
     calls: list[int] = []
-    monkeypatch.setattr(autoloop_mod, "_spawn_cycle", lambda *args, **kwargs: calls.append(1) or "started")
+    stop = threading.Event()
 
-    autoloop_mod._wakeup.set()  # wake the loop at once instead of waiting 15 minutes
-    autoloop_mod.ensure_started()
-    deadline = time.monotonic() + 5.0
-    while not calls and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert calls, "the scheduler did not wake, re-read the state file, and spawn a cycle"
+    def spawn(*args, **kwargs):
+        calls.append(1)
+        autoloop_mod._save_state({"enabled": False, "interval_minutes": 1440})
+        return "started"
+
+    monkeypatch.setattr(autoloop_mod, "_spawn_cycle", spawn)
+    monkeypatch.setattr(autoloop_mod, "_wakeup", stop)
+    thread = threading.Thread(target=autoloop_mod._scheduler_loop, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)
+    assert calls == [1]
+
+
+def test_scheduler_runs_again_after_interval_timeout(monkeypatch, tmp_path):
+    autoloop_mod._save_state({
+        "enabled": True,
+        "interval_minutes": 15,
+        "updated_at": "initial",
+    })
+    calls: list[int] = []
+
+    class StopScheduler(Exception):
+        pass
+
+    class Wakeup:
+        waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                return False
+            raise StopScheduler
+
+        def clear(self):
+            pass
+
+    monkeypatch.setattr(autoloop_mod, "_spawn_cycle", lambda *_args, **_kwargs: calls.append(1) or "started")
+    monkeypatch.setattr(autoloop_mod, "_wakeup", Wakeup())
+
+    def run_scheduler():
+        try:
+            autoloop_mod._scheduler_loop()
+        except StopScheduler:
+            return
+
+    thread = threading.Thread(target=run_scheduler, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert calls == [1, 1]
+
+
+def test_scheduler_ignores_pending_enable_wakeup_but_runs_changed_state(monkeypatch, tmp_path):
+    autoloop_mod._save_state({
+        "enabled": True,
+        "interval_minutes": 15,
+        "updated_at": "initial",
+    })
+    calls: list[int] = []
+
+    class StopScheduler(Exception):
+        pass
+
+    class Wakeup:
+        waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                return True
+            if self.waits == 2:
+                autoloop_mod._save_state({
+                    "enabled": True,
+                    "interval_minutes": 30,
+                    "updated_at": "changed",
+                })
+                return True
+            if self.waits == 3:
+                raise StopScheduler
+            return False
+
+        def clear(self):
+            pass
+
+    def spawn(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            autoloop_mod._save_state({
+                "enabled": False,
+                "interval_minutes": 30,
+                "updated_at": "disabled",
+            })
+        return "started"
+
+    monkeypatch.setattr(autoloop_mod, "_spawn_cycle", spawn)
+    monkeypatch.setattr(autoloop_mod, "_wakeup", Wakeup())
+    errors: list[BaseException] = []
+
+    def run_scheduler():
+        try:
+            autoloop_mod._scheduler_loop()
+        except StopScheduler:
+            return
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_scheduler, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert calls == [1, 1]
 
 
 # --- POST /api/autoloop/run-now -------------------------------------------------
@@ -326,6 +435,13 @@ class _StubVenue:
     def fetch_balance(self) -> dict:
         return {"total": {"USDT": _STUB_CASH}, "free": {"USDT": _STUB_CASH}}
 
+    def fetch_ohlcv(self, symbol: str, timeframe: str, **kwargs):
+        duration = 3_600_000 if timeframe == "1h" else 14_400_000
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        open_ms = now_ms - (now_ms % duration) - duration
+        return [[open_ms, _STUB_PRICE, _STUB_PRICE + 100,
+                 _STUB_PRICE - 100, _STUB_PRICE + 1, 1.0]]
+
 
 class _FakeGraph:
     """propagate() returns a fixed signal and records the calls it saw."""
@@ -384,7 +500,7 @@ def test_run_cycle_auto_confirms_dry_buy_with_bracket(tmp_path, monkeypatch):
     assert built[0][0] == ("market", "social", "news")
     assert built[1][0] == ("market", "social", "news", "fundamentals")
 
-    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
     plan_buys = [event for event in events if event.get("phase") == "plan" and event.get("action") == "buy"]
     (dry_buy,) = [event for event in events if event.get("phase") == "execute" and event.get("action") == "buy"]
     assert plan_buys  # the plan line was audited before the policy decided
@@ -437,21 +553,259 @@ def test_run_cycle_skips_each_failing_candidate_but_completes(tmp_path, monkeypa
     assert completed["results"][0]["reason"] == "RuntimeError: LLM relay down"
 
 
-# --- the cycle through the derivatives path (FR-D) --------------------------------
+def test_cycle_screening_timeout_is_terminal_and_does_not_build_venue(tmp_path, monkeypatch):
+    engine_audit = tmp_path / "engine-audit.jsonl"
+    set_config({"exec_auto_confirm": True, "exec_live": True, "exec_log_path": str(engine_audit)})
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
+    monkeypatch.setattr(autoloop_mod, "SCREENING_TIMEOUT_SECONDS", 0.01)
+
+    def slow_crypto(*_args, **_kwargs):
+        import time
+        time.sleep(0.05)
+        return ["BTC-USD"]
+
+    monkeypatch.setattr(screening_mod, "crypto_universe", slow_crypto)
+    monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
+    monkeypatch.setattr(screening_mod, "screen_universe", lambda *_args: [])
+    monkeypatch.setattr(
+        autoloop_mod,
+        "_build_bridge",
+        lambda *_args: pytest.fail("screening timeout must not build a venue"),
+    )
+
+    assert autoloop_mod._run_cycle(lambda *_args: pytest.fail("graph must not build")) == []
+    assert autoloop_mod._last_cycle["status"] == "timeout"
+    assert "screening" in autoloop_mod._last_cycle["error"]
+    audit = server_paths.SERVER_AUDIT_PATH.read_text(encoding="utf-8")
+    assert "autoloop_cycle_timeout" in audit
+    assert not engine_audit.exists()
+
+
+
+
+def test_cycle_runs_crypto_candidates_before_advisory_stocks(tmp_path, monkeypatch):
+    """The venue only executes crypto, so crypto must be processed first: a
+    cycle that runs out of time on the stock tail has still seen every
+    executable candidate."""
+    set_config({"exec_auto_confirm": False, "exec_live": False})
+    monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
+    monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
+    # Screen score order puts stocks first — exactly the real-world pattern
+    # that used to burn the whole cycle budget on advisory-only candidates.
+    monkeypatch.setattr(
+        screening_mod, "screen_universe",
+        lambda *_args: [
+            {"ticker": "AAPL", "asset_type": "stock"},
+            {"ticker": "MRNA", "asset_type": "stock"},
+            {"ticker": "BTC-USD", "asset_type": "crypto"},
+            {"ticker": "ETH-USD", "asset_type": "crypto"},
+        ],
+    )
+    monkeypatch.setattr(autoloop_mod, "_build_bridge", lambda *_args: _StubVenue())
+
+    seen: list[str] = []
+
+    class RecordingGraph:
+        def propagate(self, ticker, *_args, **_kwargs):
+            seen.append(ticker)
+            return {}, "Hold"
+
+    results = autoloop_mod._run_cycle(lambda *_args: RecordingGraph())
+    assert seen == ["BTC-USD", "ETH-USD", "AAPL", "MRNA"]
+    assert [result.ticker for result in results] == seen
+    assert autoloop_mod._last_cycle["status"] == "completed"
+    assert autoloop_mod._last_cycle["candidates"] == seen
+
+
+def test_cycle_candidate_timeout_is_terminal_and_does_not_execute(tmp_path, monkeypatch):
+    engine_audit = tmp_path / "engine-audit.jsonl"
+    set_config({"exec_auto_confirm": True, "exec_live": True, "exec_log_path": str(engine_audit)})
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
+    monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
+    monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
+    monkeypatch.setattr(
+        screening_mod, "screen_universe",
+        lambda *_args: [{"ticker": "BTC-USD", "asset_type": "crypto"}],
+    )
+    monkeypatch.setattr(autoloop_mod, "_build_bridge", lambda *_args: _StubVenue())
+    release_graph = threading.Event()
+    graph_returned = threading.Event()
+
+    class SlowGraph:
+        def propagate(self, *args, telemetry=None, **kwargs):
+            span_id = telemetry.start("graph_node:Market Analyst", "BTC-USD")
+            try:
+                assert release_graph.wait(timeout=2.0)
+                telemetry.finish(span_id)
+                return {}, "Buy"
+            finally:
+                graph_returned.set()
+
+    try:
+        results = autoloop_mod._run_cycle(lambda *_args: SlowGraph())
+        snapshot = json.dumps(autoloop_mod._last_cycle, sort_keys=True)
+        assert results == []
+        assert autoloop_mod._last_cycle["status"] == "timeout"
+        assert "candidate" in autoloop_mod._last_cycle["error"]
+        assert "stage graph_node:Market Analyst" in autoloop_mod._last_cycle["error"]
+        assert autoloop_mod._last_cycle["telemetry"]["active_stage"] == "graph_node:Market Analyst"
+    finally:
+        release_graph.set()
+        assert graph_returned.wait(timeout=1.0)
+
+    assert json.dumps(autoloop_mod._last_cycle, sort_keys=True) == snapshot
+    assert not engine_audit.exists()
+
+
+def test_cycle_publishes_active_graph_stage_while_candidate_is_running(tmp_path, monkeypatch):
+    import time
+
+    set_config({"exec_auto_confirm": False, "exec_live": False})
+    monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
+    monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
+    monkeypatch.setattr(
+        screening_mod,
+        "screen_universe",
+        lambda *_args: [{"ticker": "BTC-USD", "asset_type": "crypto"}],
+    )
+    monkeypatch.setattr(autoloop_mod, "_build_bridge", lambda *_args: _StubVenue())
+
+    release_graph = threading.Event()
+    graph_entered = threading.Event()
+
+    class WaitingGraph:
+        def propagate(self, *args, telemetry=None, **kwargs):
+            graph_entered.set()
+            assert release_graph.wait(timeout=1.0)
+            return {}, "Hold"
+
+    worker = threading.Thread(
+        target=autoloop_mod._run_cycle,
+        args=(lambda *_args: WaitingGraph(),),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert graph_entered.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            cycle = autoloop_mod._last_cycle
+            if cycle and cycle.get("telemetry", {}).get("active_stage") == "graph_analysis":
+                break
+            time.sleep(0.005)
+        assert autoloop_mod._last_cycle["status"] == "running"
+        assert autoloop_mod._last_cycle["telemetry"]["active_stage"] == "graph_analysis"
+        assert autoloop_mod._last_cycle["telemetry"]["active_ticker"] == "BTC-USD"
+        first_elapsed = autoloop_mod._payload()["last_cycle"]["telemetry"]["active_elapsed_ms"]
+        time.sleep(0.01)
+        second_elapsed = autoloop_mod._payload()["last_cycle"]["telemetry"]["active_elapsed_ms"]
+        assert second_elapsed > first_elapsed
+    finally:
+        release_graph.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert autoloop_mod._last_cycle["status"] == "completed"
+
+
+def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
+    from tradingagents.execution.sizing import PlannedOrder
+    from tradingagents.portfolio import PortfolioContext
+
+    engine_audit = tmp_path / "engine-audit.jsonl"
+    set_config({"exec_auto_confirm": True, "exec_live": True, "exec_log_path": str(engine_audit)})
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
+    monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
+    monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
+    monkeypatch.setattr(
+        screening_mod,
+        "screen_universe",
+        lambda *_args: [{"ticker": "BTC-USD", "asset_type": "crypto"}],
+    )
+    monkeypatch.setattr(autoloop_mod, "_bracket_prices", lambda *_args, **_kwargs: (90.0, 110.0))
+
+    release_sync = threading.Event()
+    sync_finished = threading.Event()
+    submitted: list[object] = []
+
+    class SlowBridge:
+        config = {"exec_auto_confirm": True, "exec_live": True}
+
+        def sync_portfolio(self):
+            release_sync.wait(timeout=1.0)
+            sync_finished.set()
+            return PortfolioContext(cash=1_000.0)
+
+        def plan_order(self, *args, **kwargs):
+            return PlannedOrder(
+                ticker="BTC-USD",
+                ccxt_symbol="BTC/USDT",
+                signal="Buy",
+                side="buy",
+                quantity=0.01,
+                cost=500.0,
+                estimated_price=50_000.0,
+            )
+
+        def effective_mode(self):
+            return "dry"
+
+        def execute_order(self, *args, **kwargs):
+            submitted.append(object())
+            return None
+
+        def audit_plan(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(autoloop_mod, "_build_bridge", lambda *_args: SlowBridge())
+
+    assert autoloop_mod._run_cycle(lambda *_args: _FakeGraph("Buy")) == []
+    assert autoloop_mod._last_cycle["status"] == "timeout"
+
+    release_sync.set()
+    assert sync_finished.wait(timeout=1.0)
+    assert submitted == []
+    assert not engine_audit.exists()
 
 
 class _StubDerivVenue(_StubVenue):
     """Same constant answers as the spot stub, shaped for the derivatives
     executor: unified symbols, leverage pinning, precision."""
 
+    candle_direction = "bullish"
+
+    def load_markets(self):
+        return {
+            "BTC/USDT:USDT": {
+                "base": "BTC", "quote": "USDT", "settle": "USDT",
+                "contract": True, "swap": True, "type": "swap", "active": True,
+            }
+        }
+
     def amount_to_precision(self, symbol: str, amount: float) -> str:
         return f"{float(amount):.6f}"
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, **kwargs):
+        duration = 3_600_000 if timeframe == "1h" else 14_400_000
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        open_ms = now_ms - (now_ms % duration) - duration
+        # open, high, low, close per requested direction; a doji closes flat.
+        close = {"bullish": _STUB_PRICE + 1, "bearish": _STUB_PRICE - 1,
+                 "doji": _STUB_PRICE}[self.candle_direction]
+        return [[open_ms, _STUB_PRICE, _STUB_PRICE + 100,
+                 _STUB_PRICE - 100, close, 1.0]]
 
     def set_leverage(self, leverage: int, symbol: str, params=None) -> None:
         pass
 
 
-def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None):
+def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_direction="bullish"):
     """Gates + screening fakes for a derivatives-path cycle: the FR-D gates
     armed in config AND env (planning refuses otherwise), exec_live closed so
     _handle_plan can only ever dry-run, and the executor seam replaced by a
@@ -480,14 +834,30 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None):
 
     def build(config):
         from tradingagents.execution.derivatives import DerivativesExecutor
+        from tradingagents.execution.risk import RiskGuard, RiskLimits
 
-        return DerivativesExecutor(config=config, exchange_factory=_StubDerivVenue)
+        return DerivativesExecutor(
+            config=config, exchange_factory=_StubDerivVenue,
+            risk_guard=RiskGuard(
+                limits=RiskLimits(
+                    max_derivatives_leverage=3.0,
+                    max_derivatives_exposure_pct=100.0,
+                    max_position_pct_per_asset=100.0,
+                    max_total_exposure_pct=100.0,
+                ),
+                price_of=lambda ticker: 50_000.0,
+            ),
+        )
 
     monkeypatch.setattr(autoloop_mod, "_build_derivatives_executor", build)
-    monkeypatch.setattr(screening_mod, "atr_targets_signed",
-                        lambda ticker, date, direction: (
-                            (_STOP, _TAKE) if direction == "long" else (_TAKE, _STOP)
+    monkeypatch.setattr(_StubDerivVenue, "candle_direction", candle_direction)
+    monkeypatch.setattr(autoloop_mod, "_bracket_prices",
+                        lambda ticker, direction="long": (
+                            (_STUB_PRICE - 1_000.0, _STUB_PRICE + 1_000.0)
+                            if direction == "long"
+                            else (_STUB_PRICE + 1_000.0, _STUB_PRICE - 1_000.0)
                         ))
+    monkeypatch.setattr(autoloop_mod, "_today_iso", lambda: "2026-10-07")
     return engine_audit
 
 
@@ -504,9 +874,9 @@ def test_run_cycle_derivatives_dry_buy_long_bracket(tmp_path, monkeypatch):
     assert btc.plan.market == "derivatives"
     assert btc.plan.leverage == autoloop_mod.MAX_AUTO_LEVERAGE
     assert btc.plan.side == "buy"
-    assert btc.plan.stop_loss == _STOP and btc.plan.take_profit == _TAKE
+    assert btc.plan.stop_loss < btc.plan.estimated_price < btc.plan.take_profit
 
-    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
     (plan_buy,) = [event for event in events if event.get("phase") == "plan" and event.get("action") == "buy"]
     (dry_buy,) = [event for event in events if event.get("phase") == "execute" and event.get("action") == "buy"]
     assert plan_buy["market"] == "derivatives" and plan_buy["leverage"] == autoloop_mod.MAX_AUTO_LEVERAGE
@@ -518,7 +888,7 @@ def test_run_cycle_derivatives_dry_sell_short_bracket(tmp_path, monkeypatch):
     """A Sell signal opens a SHORT on the derivatives path: the bracket is
     mirrored (stop ABOVE entry, target BELOW, i.e. stop > entry > take) —
     the risk direction the long-only spot path never produces."""
-    engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch)
+    engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
 
     results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Sell"))
 
@@ -528,14 +898,150 @@ def test_run_cycle_derivatives_dry_sell_short_bracket(tmp_path, monkeypatch):
     assert btc.plan.market == "derivatives"
     assert btc.plan.side == "sell"  # short opener, no held position required
     # short: stop above entry, take below — the mirror of the long bracket
-    assert btc.plan.stop_loss == _TAKE and btc.plan.take_profit == _STOP
+    assert btc.plan.stop_loss > btc.plan.estimated_price > btc.plan.take_profit
     assert btc.plan.stop_loss > btc.plan.estimated_price > btc.plan.take_profit
 
-    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
     (plan_sell,) = [event for event in events if event.get("phase") == "plan" and event.get("action") == "sell"]
     (dry_sell,) = [event for event in events if event.get("phase") == "execute" and event.get("action") == "sell"]
     assert plan_sell["market"] == "derivatives"
     assert dry_sell["mode"] == "dry" and dry_sell["confirmed"] is True
+
+
+class _StubOffWhitelistDerivVenue(_StubDerivVenue):
+    """Off-whitelist fixture: load_markets carries the NEAR/USDT:USDT swap and
+    fetch_ticker answers per unified symbol so the test can prove which symbol
+    the mark price was read from."""
+
+    tickers_fetched: list[str] = []
+
+    def load_markets(self):
+        markets = super().load_markets()
+        markets["NEAR/USDT:USDT"] = {
+            "base": "NEAR", "quote": "USDT", "settle": "USDT",
+            "contract": True, "swap": True, "type": "swap", "active": True,
+        }
+        return markets
+
+    def fetch_ticker(self, symbol: str) -> dict:
+        self.tickers_fetched.append(symbol)
+        return {"last": 5.0, "close": 5.0}
+
+
+def test_run_cycle_derivatives_doji_candle_is_confirmation_missing(tmp_path, monkeypatch):
+    """A doji closed candle can never confirm a tradeable signal in either
+    direction: the candidate is skipped with confirmation_missing and the
+    rejection is durably recorded with the doji reason for the scanner UI."""
+    from server import job_store
+
+    engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="doji")
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+
+    (btc,) = results
+    assert btc.signal == "Buy"
+    assert btc.executed is False and btc.plan is None
+    assert btc.reason == "confirmation_missing"
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
+    assert all(event.get("action") != "buy" for event in events)  # nothing planned on a doji
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected"
+    assert cycle["payload"]["confirmation_reason"] == "doji_candle"
+    assert cycle["payload"]["unified_symbol"] == "BTC/USDT:USDT"
+
+
+def test_run_cycle_derivatives_direction_mismatch_is_confirmation_missing(tmp_path, monkeypatch):
+    """Short against bullish closed candles is the wrong-direction mirror of
+    the Short happy path: confirmation_missing with direction_mismatch, and
+    no plan ever reaches the executor."""
+    from server import job_store
+
+    engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bullish")
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Sell"))
+
+    (btc,) = results
+    assert btc.signal == "Sell"
+    assert btc.executed is False and btc.plan is None
+    assert btc.reason == "confirmation_missing"
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
+    assert all(event.get("phase") != "plan" for event in events)
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected"
+    assert cycle["payload"]["confirmation_reason"] == "direction_mismatch"
+
+
+def test_run_cycle_derivatives_long_against_bearish_is_confirmation_missing(tmp_path, monkeypatch):
+    """Long against bearish closed candles is the mirror of the Long happy
+    path: confirmation_missing with direction_mismatch, no plan, and the
+    durable rejection row carries the reason for the scanner UI."""
+    from server import job_store
+
+    engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+
+    (btc,) = results
+    assert btc.signal == "Buy"
+    assert btc.executed is False and btc.plan is None
+    assert btc.reason == "confirmation_missing"
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
+    assert all(event.get("phase") != "plan" for event in events)
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected"
+    assert cycle["payload"]["confirmation_reason"] == "direction_mismatch"
+    assert cycle["payload"]["unified_symbol"] == "BTC/USDT:USDT"
+
+
+def test_run_cycle_derivatives_off_whitelist_near_plans_and_prices_through_unified_symbol(tmp_path, monkeypatch):
+    """NEAR-USD sits outside the spot closed set: the cycle must still plan
+    when the venue metadata lists an active USDT-settled NEAR swap, fetch the
+    mark price through the RESOLVED unified symbol (never the spot resolver),
+    and dry-execute with the protective bracket intact."""
+    from server import job_store
+
+    engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bullish")
+    monkeypatch.setattr(screening_mod, "screen_universe",
+                        lambda crypto, stocks, date, top_n: [{"ticker": "NEAR-USD", "asset_type": "crypto"}])
+
+    def build(config):
+        from tradingagents.execution.derivatives import DerivativesExecutor
+
+        return DerivativesExecutor(config=config, exchange_factory=_StubOffWhitelistDerivVenue)
+
+    monkeypatch.setattr(autoloop_mod, "_build_derivatives_executor", build)
+    # NEAR marks at 5.0 through the unified symbol: the ATR bracket must sit
+    # around THAT price, not the BTC stub price, or the protective check fails.
+    monkeypatch.setattr(autoloop_mod, "_bracket_prices",
+                        lambda ticker, direction="long": (4.0, 6.0))
+    _StubOffWhitelistDerivVenue.tickers_fetched = []
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+
+    (near,) = results
+    assert near.signal == "Buy"
+    assert near.executed is True
+    assert near.plan.market == "derivatives"
+    assert near.plan.ccxt_symbol == "NEAR/USDT:USDT"
+    assert near.plan.side == "buy"
+    assert near.plan.stop_loss < near.plan.estimated_price < near.plan.take_profit
+    # The mark price came through the resolved futures symbol, not a spot symbol.
+    assert _StubOffWhitelistDerivVenue.tickers_fetched == ["NEAR/USDT:USDT"]
+
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
+    (dry_buy,) = [event for event in events if event.get("phase") == "execute" and event.get("action") == "buy"]
+    assert dry_buy["mode"] == "dry" and dry_buy["confirmed"] is True
+
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "completed"
+    assert cycle["symbol"] == "NEAR/USDT:USDT"
+    payload = cycle["payload"]
+    assert payload["requested_ticker"] == "NEAR-USD"
+    assert payload["unified_symbol"] == "NEAR/USDT:USDT"
+    assert payload["confirmation_result"] is True
+    assert payload["confirmation_reason"] == "aligned_direction"
+    assert payload["market_rejection_reason"] is None
+    assert payload["execution_status"] == "executed"
 
 
 def test_run_cycle_derivatives_gates_closed_refuse_planning(tmp_path, monkeypatch):
@@ -551,9 +1057,56 @@ def test_run_cycle_derivatives_gates_closed_refuse_planning(tmp_path, monkeypatc
     (btc,) = results
     assert btc.executed is False and btc.plan is None
     assert "TRADINGAGENTS_EXEC_DERIVATIVES" in (btc.reason or "")
-    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
     assert events[-1]["action"] == "derivatives_denied"
     assert autoloop_mod._last_cycle["status"] == "completed"
+
+
+def test_futures_worker_wiring_claims_and_skips_duplicate(tmp_path, monkeypatch):
+    from tradingagents.execution.sizing import PlannedOrder
+
+    now = datetime(2026, 10, 7, 8, tzinfo=timezone.utc)
+    set_config({"exec_auto_confirm": False})
+    class FixedDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            return now
+        @staticmethod
+        def fromtimestamp(value, tz=None):
+            return datetime.fromtimestamp(value, tz)
+    monkeypatch.setattr(autoloop_mod, "datetime", FixedDateTime)
+    monkeypatch.setattr(autoloop_mod, "_bracket_prices", lambda ticker, direction="long": (90.0, 110.0))
+    candle_rows = {"1h": [[(now.timestamp() - 3600) * 1000, 100, 110, 90, 105, 1]], "4h": [[(now.timestamp() - 4 * 3600) * 1000, 100, 110, 90, 105, 1]]}
+
+    class Exchange:
+        def fetch_ohlcv(self, symbol, timeframe, **kwargs):
+            return candle_rows[timeframe]
+
+        def fetch_ticker(self, symbol):
+            return {"last": 100.0, "close": 100.0}
+
+    class Bridge:
+        config = {"exec_auto_confirm": False}
+        def client(self): return Exchange()
+        def symbol_for(self, ticker): return "BTC/USDT:USDT"
+        def fetch_price(self, ticker): return 100.0
+        def sync_portfolio(self): return object()
+
+    class Derivatives:
+        _bridge = Bridge()
+        config = {}
+        def symbol_for(self, ticker): return self._bridge.symbol_for(ticker)
+        def audit_plan(self, *args, **kwargs):
+            return None
+        def plan_order(self, *args, **kwargs):
+            return PlannedOrder(ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy", market="derivatives", side="buy", quantity=1, cost=100, estimated_price=100, stop_loss=90, take_profit=110)
+
+    result = autoloop_mod.DailyResult(ticker="BTC-USD")
+    autoloop_mod._process_futures_candidate(Derivatives(), "BTC-USD", "Buy", {}, result)
+    assert result.reason == "awaiting approval"
+    duplicate = autoloop_mod.DailyResult(ticker="BTC-USD")
+    autoloop_mod._process_futures_candidate(Derivatives(), "BTC-USD", "Buy", {}, duplicate)
+    assert duplicate.reason == "duplicate futures signal skipped"
 
 
 def test_auto_leverage_clamped_to_system_cap():

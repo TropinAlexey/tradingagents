@@ -249,7 +249,27 @@ def test_sell_without_open_lot_is_dropped():
     assert result["recent_orders"][0]["action"] == "sell"  # still visible in the execute tail
 
 
-def test_recent_orders_capped_at_50_newest_first():
+def test_derivatives_short_round_trip_and_open_mark_are_short_aware():
+    events = [
+        _fill("BTC-USD", "sell", 0.1, 100.0, "2026-10-01T01:00:00Z", market="derivatives"),
+        _fill("BTC-USD", "buy", 0.1, 80.0, "2026-10-01T02:00:00Z", market="derivatives"),
+        _fill("ETH-USD", "sell", 0.2, 200.0, "2026-10-01T03:00:00Z", market="derivatives"),
+    ]
+    result = performance_mod.compute_performance(events, price_fetcher=lambda ticker: 180.0)
+
+    assert result["summary"]["closed_trades"] == 1
+    assert result["summary"]["avg_win_pct"] == pytest.approx(20.0)
+    assert result["open_positions"] == [{
+        "ticker": "ETH-USD",
+        "qty": -0.2,
+        "entry_price": 200.0,
+        "current_price": 180.0,
+        "unrealized_pct": pytest.approx(10.0),
+        "mode": "dry",
+        "entry_at": "2026-10-01T03:00:00Z",
+    }]
+
+
     events = [
         _fill("BTC-USD", "buy", 0.001, 100.0 + i, f"2026-10-01T{600 + i}:00:00Z")
         for i in range(60)
