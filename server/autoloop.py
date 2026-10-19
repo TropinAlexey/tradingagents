@@ -832,23 +832,6 @@ def _process_futures_candidate(
         raise
 
 
-def recover_pending_brackets() -> list[dict]:
-    """Retry durable bracket tasks without recreating an entry order."""
-    config = get_config()
-    if config.get("exec_derivatives") is not True or not _env_flag("TRADINGAGENTS_EXEC_DERIVATIVES"):
-        return []
-    executor = _build_derivatives_executor(config)
-    outcomes = []
-    for task in job_store.pending_bracket_recoveries():
-        task_id = task["task_id"]
-        try:
-            status = executor.recover_bracket(task_id, confirm=True)
-        except Exception as exc:
-            status = f"error:{type(exc).__name__}:{exc}"
-        outcomes.append({"task_id": task_id, "status": status})
-    return outcomes
-
-
 def _default_graph_builder(config: dict, analysts: tuple[str, ...]) -> Any:
     # Lazy like server/daily._analyze: the graph import chain pulls LangChain.
     from tradingagents.graph.trading_graph import TradingAgentsGraph

@@ -305,13 +305,14 @@ def release_futures_signal(signal_id: str, *, status: str = "completed",
         )
         return cursor.rowcount == 1
 def create_bracket_recovery(task_id: str, *, symbol: str, entry_order_id: str, close_side: str,
-                            quantity: float, legs: list[dict], now: str) -> None:
+                            quantity: float, legs: list[dict], now: str,
+                            venue_key: str | None = None) -> None:
     with db.session() as conn:
         conn.execute(
             """INSERT INTO bracket_recovery_tasks
-               (task_id, symbol, entry_order_id, close_side, quantity, legs, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(task_id) DO NOTHING""",
-            (task_id, symbol, entry_order_id, close_side, quantity, json.dumps(legs), now),
+               (task_id, symbol, entry_order_id, close_side, quantity, legs, updated_at, venue_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(task_id) DO NOTHING""",
+            (task_id, symbol, entry_order_id, close_side, quantity, json.dumps(legs), now, venue_key),
         )
 
 
@@ -343,6 +344,16 @@ def update_bracket_recovery(task_id: str, *, status: str, placed_ids: list[str],
 def pending_bracket_recoveries() -> list[dict]:
     with db.read() as conn:
         rows = conn.execute("SELECT task_id FROM bracket_recovery_tasks WHERE status = 'pending'").fetchall()
+    return [load_bracket_recovery(row["task_id"]) for row in rows]
+
+
+def active_bracket_recoveries() -> list[dict]:
+    with db.read() as conn:
+        rows = conn.execute(
+            "SELECT task_id FROM bracket_recovery_tasks "
+            "WHERE status IN ('pending', 'monitoring', 'submission_uncertain', "
+            "'emergency_close_failed', 'emergency_cleanup_pending')"
+        ).fetchall()
     return [load_bracket_recovery(row["task_id"]) for row in rows]
 
 

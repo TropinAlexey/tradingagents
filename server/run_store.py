@@ -152,12 +152,12 @@ def list_runs(status: str | None = None, limit: int = 20, offset: int = 0) -> tu
 
 
 def reconcile_orphans() -> list[str]:
-    """Close out runs a dead process left active; returns the ids it closed.
-
-    Same reasoning as ``job_store.reconcile_orphans``: the worker lock is
-    derived from run status, so an orphaned ``running`` row would block every
-    future run with nothing in the UI able to show or clear it.
-    """
+    """Close out runs a dead process left active and persist their final event."""
+    now = _now()
+    error = {
+        "code": "interrupted",
+        "message": "The server restarted before this analysis run completed.",
+    }
     with db.session() as conn:
         rows = conn.execute(
             "SELECT run_id FROM runs WHERE status IN (?, ?) ORDER BY created_at",
@@ -165,8 +165,35 @@ def reconcile_orphans() -> list[str]:
         ).fetchall()
         if not rows:
             return []
+        for row in rows:
+            event = {
+                "seq": conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?",
+                    (row["run_id"],),
+                ).fetchone()[0],
+                "ts": now,
+                "type": "run_interrupted",
+                "role": "system",
+                "stage": "system",
+                "agent": None,
+                "replay": False,
+                "payload": {"error": error},
+            }
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO run_events (run_id, seq, ts, type, role, stage,
+                                                  agent, replay, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["run_id"], event["seq"], event["ts"], event["type"],
+                    event["role"], event["stage"], event["agent"], 0,
+                    json.dumps(event["payload"], ensure_ascii=False),
+                ),
+            )
         conn.execute(
-            "UPDATE runs SET status = 'interrupted', finished_at = ? WHERE status IN (?, ?)",
-            (_now(), *ACTIVE_STATUSES),
+            "UPDATE runs SET status = 'interrupted', error = ?, finished_at = ? "
+            "WHERE status IN (?, ?)",
+            (json.dumps(error), now, *ACTIVE_STATUSES),
         )
     return [row["run_id"] for row in rows]

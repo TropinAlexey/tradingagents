@@ -28,14 +28,13 @@ plan sizing uses margin (``cost``) with notional = margin * leverage.
 
 from __future__ import annotations
 
-import logging
-from datetime import datetime, timezone
 from typing import Any
 
 from server import job_store
 from tradingagents.agents.rating import RATINGS_5_TIER, is_review
 from tradingagents.dataflows.symbols import futures_base
 from tradingagents.default_config import _BOOL_TRUE
+from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.execution.futures_safety import (
     FuturesPlanError,
@@ -44,8 +43,6 @@ from tradingagents.execution.futures_safety import (
 )
 from tradingagents.execution.sizing import PlannedOrder, SizingRules
 from tradingagents.portfolio import PortfolioContext
-
-logger = logging.getLogger(__name__)
 
 _BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
 
@@ -460,122 +457,30 @@ class DerivativesExecutor:
         return order_id
 
     def _place_bracket(self, order: PlannedOrder, confirm: bool, entry_order_id: str | None) -> None:
-        """Attach exchange-side protective exits after a derivatives entry fill.
-
-        Failure creates a durable recovery task. The entry remains successful and
-        is never retried as a blind replacement; recovery reconciles venue orders,
-        retries only missing legs idempotently, and closes reduce-only if protection
-        cannot be established.
-        """
-        close_side = "sell" if order.side == "buy" else "buy"
-        exchange = self._bridge.client()
-        legs: list[tuple[str, dict[str, Any]]] = []
-        if order.stop_loss is not None:
-            legs.append(("stop-loss", {"stopLossPrice": order.stop_loss}))
-        if order.take_profit is not None:
-            legs.append(("take-profit", {"takeProfitPrice": order.take_profit}))
-        if not legs:
-            return
-        placed_ids: list[str] = []
-        try:
-            for _leg_name, leg_params in legs:
-                response = exchange.create_order(
-                    order.ccxt_symbol, "market", close_side, order.quantity,
-                    None, {**leg_params, "reduceOnly": True},
-                )
-                if isinstance(response, dict) and response.get("id"):
-                    placed_ids.append(str(response["id"]))
-        except Exception as exc:  # entry already filled; preserve that fact
-            task_id = f"bracket:{order.ccxt_symbol}:{entry_order_id or 'unknown'}"
-            now = datetime.now(timezone.utc).isoformat()
-            job_store.create_bracket_recovery(
-                task_id, symbol=order.ccxt_symbol, entry_order_id=entry_order_id or "unknown",
-                close_side=close_side, quantity=float(order.quantity),
-                legs=[{"name": name, "params": params, "status": "placed" if index < len(placed_ids) else "pending",
-                       "order_id": placed_ids[index] if index < len(placed_ids) else None}
-                      for index, (name, params) in enumerate(legs)], now=now,
-            )
-            job_store.update_bracket_recovery(
-                task_id, status="pending", placed_ids=placed_ids, attempts=0,
-                last_error=repr(exc), now=now,
-            )
-            self._bridge.audit_plan(
-                order, action="bracket_failed",
-                reason=f"protective exits failed after entry fill; recovery task {task_id}: {exc!r}",
-                confirmed=confirm, order_id=entry_order_id, phase="execute",
-            )
-            return
-        bracket_id = ",".join(placed_ids) if placed_ids else None
-        self._bridge.audit_plan(
-            order, action="bracket_placed", confirmed=confirm, order_id=bracket_id,
-            reason="exchange-side conditional stopLoss/takeProfit attached after derivatives fill",
-            phase="execute",
-        )
+        BracketManager(self._bridge).place(order, confirm, entry_order_id)
 
     def recover_bracket(self, task_id: str, *, confirm: bool = True) -> str:
-        """Retry missing protective legs idempotently; emergency-close after retry exhaustion."""
-        task = job_store.load_bracket_recovery(task_id)
-        if task is None:
-            raise KeyError(task_id)
-        if task["status"] in {"completed", "emergency_closed"}:
-            return task["status"]
+        """Repair protective exits only while live and derivatives gates are open."""
         if confirm is not True:
             raise PermissionError("bracket recovery requires confirm=True")
-        exchange = self._bridge.client()
-        existing = exchange.fetch_open_orders(task["symbol"]) if hasattr(exchange, "fetch_open_orders") else []
-        known = set(task["placed_ids"])
-        for item in existing or []:
-            if not isinstance(item, dict) or not item.get("id"):
-                continue
-            params = item.get("info") if isinstance(item.get("info"), dict) else item
-            for leg in task["legs"]:
-                if leg.get("status") == "placed":
-                    continue
-                if item.get("side") == task["close_side"] and (
-                    leg["params"].get("stopLossPrice") == params.get("stopLossPrice")
-                    or leg["params"].get("takeProfitPrice") == params.get("takeProfitPrice")
-                ):
-                    leg["status"] = "placed"
-                    leg["order_id"] = str(item["id"])
-                    known.add(str(item["id"]))
-        try:
-            for leg in task["legs"]:
-                if leg.get("status") == "placed":
-                    continue
-                response = exchange.create_order(
-                    task["symbol"], "market", task["close_side"], task["quantity"],
-                    None, {**leg["params"], "reduceOnly": True},
-                )
-                if isinstance(response, dict) and response.get("id"):
-                    leg["status"] = "placed"
-                    leg["order_id"] = str(response["id"])
-                    known.add(str(response["id"]))
-            complete = all(leg.get("status") == "placed" for leg in task["legs"])
-            if not complete:
-                raise RuntimeError("one or more protective legs remain missing")
-            job_store.update_bracket_recovery(
-                task_id, status="completed", placed_ids=sorted(known),
-                attempts=task["attempts"] + 1, last_error=None,
-                now=datetime.now(timezone.utc).isoformat(), legs=task["legs"],
-            )
-            return "completed"
-        except Exception as exc:
-            emergency_error = None
-            try:
-                exchange.create_order(
-                    task["symbol"], "market", task["close_side"], task["quantity"],
-                    None, {"reduceOnly": True, "clientOrderId": f"emergency:{task_id}"},
-                )
-            except Exception as emergency_exc:
-                emergency_error = emergency_exc
-            finally:
-                job_store.update_bracket_recovery(
-                    task_id, status="emergency_closed", placed_ids=sorted(known),
-                    attempts=task["attempts"] + 1,
-                    last_error=repr(emergency_error or exc),
-                    now=datetime.now(timezone.utc).isoformat(), legs=task["legs"],
-                )
-            return "emergency_closed"
+        if self.config.get("exec_derivatives") is not True or not _env_derivatives_flag():
+            raise PermissionError("bracket recovery requires derivatives execution gates")
+        if self.effective_mode() != "live":
+            raise PermissionError("bracket recovery requires live execution gates")
+        return BracketManager(self._bridge).reconcile(
+            task_id, repair_missing=True, allow_sibling_cancel=True,
+        )
+
+    def monitor_bracket(self, task_id: str) -> str:
+        """Inspect protective exits; sibling cancellation requires both live gates."""
+        allow_cancel = (
+            self.config.get("exec_derivatives") is True
+            and _env_derivatives_flag()
+            and self.effective_mode() == "live"
+        )
+        return BracketManager(self._bridge).reconcile(
+            task_id, repair_missing=False, allow_sibling_cancel=allow_cancel,
+        )
 
     def effective_mode(self) -> str:
         """The gate-decided mode right now: ``"live"`` or ``"dry"`` (FR5).

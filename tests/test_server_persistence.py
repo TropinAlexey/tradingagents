@@ -100,9 +100,9 @@ def client(_server_state):
         yield test_client
 
 
-def _drain_sse(client: TestClient, url: str) -> list[dict]:
+def _drain_sse(client: TestClient, url: str, headers: dict | None = None) -> list[dict]:
     events = []
-    with client.stream("GET", url) as response:
+    with client.stream("GET", url, headers=headers) as response:
         assert response.status_code == 200
         for line in response.iter_lines():
             if line.startswith("data: "):
@@ -379,9 +379,36 @@ def test_orphaned_run_is_reconciled_at_startup(client):
         "analysts": list(run.analysts), "created_at": run.created_at, "finished_at": None,
     })
 
+    run_store.append_event("r_orphan", {
+        "seq": 1,
+        "ts": f"{_today()}T00:00:01+00:00",
+        "type": "message",
+        "role": "analyst",
+        "stage": "analyst",
+        "agent": "Market Analyst",
+        "replay": False,
+        "payload": {"content": "partial evidence"},
+    })
+
     assert runs_mod.reconcile() == ["r_orphan"]
-    assert client.get("/api/runs/r_orphan").json()["status"] == "interrupted"
+    detail = client.get("/api/runs/r_orphan").json()
+    assert detail["status"] == "interrupted"
+    assert detail["error"]["code"] == "interrupted"
     assert client.get("/api/runs").json()["active_run_id"] is None
+    events = _drain_sse(client, "/api/runs/r_orphan/events")
+    assert [event["seq"] for event in events] == [1, 2]
+    assert events[0]["type"] == "message"
+    assert events[-1]["type"] == "run_interrupted"
+    assert events[-1]["payload"]["error"]["code"] == "interrupted"
+    resumed = _drain_sse(
+        client,
+        "/api/runs/r_orphan/events",
+        headers={"Last-Event-ID": "1"},
+    )
+    assert [event["seq"] for event in resumed] == [2]
+    assert run_store.load_events("r_orphan", after_seq=1)[0]["type"] == "run_interrupted"
+    assert runs_mod.reconcile() == []
+    assert [event["seq"] for event in run_store.load_events("r_orphan")] == [1, 2]
 
 
 def test_job_results_are_replaced_not_duplicated(client, tmp_path):

@@ -38,6 +38,11 @@ class FakeDerivExchange:
         self.calls = []
         self.bracket_calls = []
         self.open_orders = []
+        self.orders_by_id = {}
+        self.cancel_error = None
+        self.cancel_response = {"status": "canceled"}
+        self.emergency_error = None
+        self.fetch_open_orders_error = None
         self._markets_loaded = False
 
     def fetch_ticker(self, symbol):
@@ -66,8 +71,10 @@ class FakeDerivExchange:
 
     def create_order(self, symbol, order_type, side, amount, price=None, params=None):
         self.calls.append(("create_order", symbol, order_type, side, amount, params))
-        if params and params.get("clientOrderId", "").startswith("emergency:"):
-            return {"id": f"emergency-{len(self.calls)}"}
+        if params and params.get("clientOrderId", "").startswith("emergency-"):
+            if self.emergency_error is not None:
+                raise self.emergency_error
+            return {"id": f"emergency-{len(self.calls)}", "status": "closed"}
         if params:
             if self.bracket_error is not None:
                 raise self.bracket_error
@@ -77,11 +84,52 @@ class FakeDerivExchange:
         if self.create_order_error is not None:
             raise self.create_order_error
         order_id = f"deriv-{len(self.calls)}"
+        if params and "stopLossPrice" in params:
+            algo_type = "STOP_MARKET"
+            trigger_price = params["stopLossPrice"]
+        elif params and "takeProfitPrice" in params:
+            algo_type = "TAKE_PROFIT_MARKET"
+            trigger_price = params["takeProfitPrice"]
+        else:
+            return {"id": order_id}
+        algo_order = {
+            "id": order_id, "symbol": symbol, "side": side,
+            "amount": amount, "type": "market", "status": "open",
+            "info": {
+                "algoId": order_id, "symbol": "BTCUSDT", "side": side.upper(),
+                "algoStatus": "NEW", "orderType": algo_type,
+                "triggerPrice": str(trigger_price), "quantity": str(amount),
+                "reduceOnly": True,
+            },
+        }
+        self.open_orders.append(algo_order)
+        self.orders_by_id[order_id] = algo_order
         return {"id": order_id}
 
-    def fetch_open_orders(self, symbol):
-        self.calls.append(("fetch_open_orders", symbol))
+    def fetch_open_orders(self, symbol, since=None, limit=None, params=None):
+        self.calls.append(("fetch_open_orders", symbol, since, limit, params))
+        if self.fetch_open_orders_error is not None:
+            raise self.fetch_open_orders_error
         return list(self.open_orders)
+
+    def fetch_orders(self, symbol, since=None, limit=None, params=None):
+        self.calls.append(("fetch_orders", symbol, since, limit, params))
+        return list(self.orders_by_id.values())
+
+    def fetch_order(self, order_id, symbol, params=None):
+        self.calls.append(("fetch_order", order_id, symbol, params))
+        if order_id in self.orders_by_id:
+            return self.orders_by_id[order_id]
+        for item in self.open_orders:
+            if str(item.get("id") or item.get("info", {}).get("algoId")) == str(order_id):
+                return item
+        raise ccxt.OrderNotFound(f"unknown fake order {order_id}")
+
+    def cancel_order(self, order_id, symbol, params=None):
+        self.calls.append(("cancel_order", order_id, symbol, params))
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        return {"id": order_id, **self.cancel_response}
 
     def fetch_balance(self):
         self.calls.append(("fetch_balance",))
@@ -427,6 +475,8 @@ def test_live_execute_places_market_order(tmp_path, monkeypatch):
     assert event["order_id"].count("deriv-") == 2
     assert event["confirmed"] is True
     assert event["mode"] == "live"
+    assert event["market"] == "derivatives"
+    assert event["cost"] == pytest.approx(order.cost)
 
 
 def test_live_execute_sets_leverage_before_create_order(tmp_path, monkeypatch):
@@ -613,6 +663,100 @@ def _failed_bracket_task(tmp_path, monkeypatch, exchange):
     return executor, order, f"bracket:{order.ccxt_symbol}:{entry_id}", job_store
 
 
+def _placed_bracket_task(tmp_path, monkeypatch, exchange=None):
+    exchange = exchange or FakeDerivExchange()
+    executor, order, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
+    task = store.load_bracket_recovery(task_id)
+    assert task["status"] == "monitoring"
+    assert len(task["placed_ids"]) == 2
+    return executor, order, task_id, store, exchange
+
+
+def _algo_order(order_id, order, *, kind="stop-loss", status="NEW", **info):
+    trigger = order.stop_loss if kind == "stop-loss" else order.take_profit
+    return {
+        "id": order_id, "symbol": order.ccxt_symbol, "side": "sell",
+        "amount": order.quantity, "type": "market", "status": "open",
+        "info": {
+            "algoId": order_id, "symbol": "BTCUSDT", "side": "SELL",
+            "algoStatus": status,
+            "orderType": "STOP_MARKET" if kind == "stop-loss" else "TAKE_PROFIT_MARKET",
+            "triggerPrice": str(trigger), "quantity": str(order.quantity),
+            "reduceOnly": True, **info,
+        },
+    }
+
+
+def test_cancel_binance_algo_success_response_is_terminal(tmp_path, monkeypatch):
+    executor, order, task_id, store, exchange = _placed_bracket_task(tmp_path, monkeypatch)
+    stop_id, take_id = store.load_bracket_recovery(task_id)["placed_ids"]
+    exchange.open_orders = [_algo_order(stop_id, order)]
+    exchange.orders_by_id[take_id] = _algo_order(take_id, order, kind="take-profit", status="FINISHED")
+    exchange.cancel_response = {"info": {"algoId": stop_id, "code": "200", "msg": "success"}}
+
+    assert executor.recover_bracket(task_id) == "reconciled_take_profit"
+    calls_before = len(exchange.calls)
+    assert executor.monitor_bracket(task_id) == "reconciled_take_profit"
+    assert len(exchange.calls) == calls_before
+
+
+@pytest.mark.parametrize("changes", [
+    {"symbol": "ETH/USDT:USDT", "info": {"symbol": "ETHUSDT"}},
+    {"amount": 500, "info": {"quantity": "500"}},
+    {"info": {"reduceOnly": False}},
+    {"info": {"orderType": "TAKE_PROFIT_MARKET"}},
+])
+def test_pending_recovery_does_not_adopt_unrelated_algo(tmp_path, monkeypatch, changes):
+    exchange = FakeDerivExchange(fail_bracket_calls=1)
+    executor, order, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
+    unrelated = _algo_order("unrelated-stop", order)
+    unrelated["info"].update(changes.get("info", {}))
+    unrelated.update({key: value for key, value in changes.items() if key != "info"})
+    exchange.open_orders = [unrelated]
+
+    assert executor.recover_bracket(task_id) == "monitoring"
+    assert "unrelated-stop" not in store.load_bracket_recovery(task_id)["placed_ids"]
+
+
+def test_recorded_algo_id_is_not_replaced_by_same_trigger_order(tmp_path, monkeypatch):
+    executor, order, task_id, store, exchange = _placed_bracket_task(tmp_path, monkeypatch)
+    stop_id, take_id = store.load_bracket_recovery(task_id)["placed_ids"]
+    exchange.open_orders = [_algo_order("other-bracket-stop", order), _algo_order(stop_id, order)]
+    exchange.orders_by_id[take_id] = _algo_order(take_id, order, kind="take-profit", status="FINISHED")
+
+    assert executor.recover_bracket(task_id) == "reconciled_take_profit"
+    assert [call[1] for call in exchange.calls if call[0] == "cancel_order"] == [stop_id]
+
+
+def test_leg_inspection_failure_blocks_pending_repair(tmp_path, monkeypatch):
+    executor, order, task_id, store, exchange = _placed_bracket_task(tmp_path, monkeypatch)
+    task = store.load_bracket_recovery(task_id)
+    stop_id = task["legs"][0]["order_id"]
+    task["legs"][1].update(status="pending", order_id=None)
+    store.update_bracket_recovery(
+        task_id, status="pending", placed_ids=[stop_id], attempts=0,
+        last_error=None, now=FROZEN_NOW.isoformat(), legs=task["legs"],
+    )
+    exchange.open_orders = []
+    exchange.orders_by_id = {}
+    calls_before = len(exchange.calls)
+
+    assert executor.recover_bracket(task_id) == "reconcile_incomplete"
+    assert not [call for call in exchange.calls[calls_before:] if call[0] in {"create_order", "cancel_order"}]
+
+
+@pytest.mark.parametrize("status", ["TRIGGERING", "TRIGGERED"])
+def test_algo_trigger_without_execution_confirmation_keeps_sibling(tmp_path, monkeypatch, status):
+    executor, order, task_id, store, exchange = _placed_bracket_task(tmp_path, monkeypatch)
+    stop_id, take_id = store.load_bracket_recovery(task_id)["placed_ids"]
+    exchange.open_orders = [_algo_order(stop_id, order)]
+    exchange.orders_by_id[take_id] = _algo_order(take_id, order, kind="take-profit", status=status)
+    calls_before = len(exchange.calls)
+
+    assert executor.recover_bracket(task_id) in {"monitoring", "reconcile_incomplete"}
+    assert not [call for call in exchange.calls[calls_before:] if call[0] in {"create_order", "cancel_order"}]
+
+
 def test_partial_bracket_failure_persists_each_leg(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(fail_bracket_calls=1)
     _, order, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
@@ -633,7 +777,7 @@ def test_partial_bracket_failure_persists_each_leg(tmp_path, monkeypatch):
 
 def test_bracket_recovery_retries_after_restart(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(fail_bracket_calls=1)
-    executor, _, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
+    executor, order, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
     reloaded_executor = make_executor(
         tmp_path, monkeypatch,
         config=live_config(risk_max_derivatives_exposure_pct=100.0),
@@ -641,34 +785,171 @@ def test_bracket_recovery_retries_after_restart(tmp_path, monkeypatch):
     )
 
     assert store.load_bracket_recovery(task_id)["status"] == "pending"
-    assert reloaded_executor.recover_bracket(task_id) == "completed"
-    assert store.load_bracket_recovery(task_id)["status"] == "completed"
+    assert reloaded_executor.recover_bracket(task_id) == "monitoring"
+    assert store.load_bracket_recovery(task_id)["status"] == "monitoring"
+    send_count = len([call for call in exchange.calls if call[0] == "create_order"])
+    assert reloaded_executor.recover_bracket(task_id) == "monitoring"
+    assert len([call for call in exchange.calls if call[0] == "create_order"]) == send_count
     assert executor is not None
 
 
 def test_recovery_reconciles_existing_leg_without_duplicate(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(fail_bracket_calls=1)
-    executor, _, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
+    executor, order, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
     exchange.open_orders = [{
-        "id": "existing-stop", "side": "sell",
-        "info": {"stopLossPrice": 48_000.0},
+        "id": "existing-stop", "symbol": order.ccxt_symbol, "side": "sell",
+        "amount": order.quantity, "type": "market", "status": "open",
+        "info": {
+            "algoId": "existing-stop", "symbol": "BTCUSDT", "side": "SELL",
+            "algoStatus": "NEW", "orderType": "STOP_MARKET",
+            "triggerPrice": "48000", "quantity": str(order.quantity),
+            "reduceOnly": True,
+        },
     }]
 
-    assert executor.recover_bracket(task_id) == "completed"
+    assert executor.recover_bracket(task_id) == "monitoring"
     recovered = [call for call in exchange.calls if call[0] == "create_order" and call[5]]
     assert [call[5] for call in recovered[-1:]] == [{"takeProfitPrice": 55_000.0, "reduceOnly": True}]
+    assert ("fetch_open_orders", order.ccxt_symbol, None, None, {"trigger": True}) in exchange.calls
     task = store.load_bracket_recovery(task_id)
     assert "existing-stop" in task["placed_ids"]
 
 
+def test_recovery_cancels_open_sibling_after_algo_leg_finishes(tmp_path, monkeypatch):
+    executor, order, task_id, store, exchange = _placed_bracket_task(tmp_path, monkeypatch)
+    task = store.load_bracket_recovery(task_id)
+    stop_id, take_id = task["placed_ids"]
+    exchange.open_orders = [{
+        "id": stop_id, "symbol": order.ccxt_symbol, "side": "sell",
+        "amount": order.quantity, "type": "market", "status": "open",
+        "info": {
+            "algoId": stop_id, "symbol": "BTCUSDT", "side": "SELL",
+            "algoStatus": "NEW", "orderType": "STOP_MARKET",
+            "triggerPrice": "48000", "quantity": str(order.quantity),
+            "reduceOnly": True,
+        },
+    }]
+    exchange.orders_by_id = {
+        stop_id: exchange.open_orders[0],
+        take_id: {
+            "id": take_id, "symbol": order.ccxt_symbol, "side": "sell",
+            "amount": order.quantity, "type": "market", "status": "closed",
+            "info": {
+                "algoId": take_id, "symbol": "BTCUSDT", "side": "SELL",
+                "algoStatus": "FINISHED", "orderType": "TAKE_PROFIT_MARKET",
+                "triggerPrice": "55000", "quantity": str(order.quantity),
+                "actualOrderId": "venue-execution-id", "reduceOnly": True,
+            },
+        },
+    }
+
+    assert executor.recover_bracket(task_id) == "reconciled_take_profit"
+    assert ("cancel_order", stop_id, order.ccxt_symbol, {"trigger": True}) in exchange.calls
+    task = store.load_bracket_recovery(task_id)
+    assert task["status"] == "reconciled_take_profit"
+    assert task["legs"][0]["status"] == "cancelled"
+    assert task["legs"][1]["status"] == "filled"
+
+
+def test_monitor_is_read_only_when_live_gate_is_closed(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange()
+    executor, order, task_id, store, _ = _placed_bracket_task(tmp_path, monkeypatch, exchange)
+    task = store.load_bracket_recovery(task_id)
+    stop_id, take_id = task["placed_ids"]
+    exchange.open_orders = []
+    exchange.orders_by_id = {
+        stop_id: {
+            "id": stop_id, "status": "open",
+            "info": {"algoId": stop_id, "algoStatus": "NEW", "orderType": "STOP_MARKET",
+                     "triggerPrice": "48000", "side": "SELL", "reduceOnly": True},
+        },
+        take_id: {
+            "id": take_id, "status": "closed",
+            "info": {"algoId": take_id, "algoStatus": "FINISHED", "orderType": "TAKE_PROFIT_MARKET",
+                     "triggerPrice": "55000", "side": "SELL", "reduceOnly": True},
+        },
+    }
+    monkeypatch.delenv("TRADINGAGENTS_EXEC_LIVE", raising=False)
+    calls_before = len(exchange.calls)
+
+    assert executor.monitor_bracket(task_id) == "reconcile_incomplete"
+    assert not [call for call in exchange.calls[calls_before:] if call[0] in {"create_order", "cancel_order"}]
+    current = store.load_bracket_recovery(task_id)
+    assert current["legs"][1]["status"] == "filled"
+    assert current["legs"][0]["status"] == "placed"
+    assert current["status"] == "monitoring"
+
+
+def test_monitor_inspection_error_does_not_send_orders(tmp_path, monkeypatch):
+    executor, _, task_id, store, exchange = _placed_bracket_task(tmp_path, monkeypatch)
+    exchange.fetch_open_orders_error = ccxt.NetworkError("offline")
+    calls_before = len(exchange.calls)
+
+    assert executor.monitor_bracket(task_id) == "inspection_failed"
+    assert len(exchange.calls) == calls_before + 1
+    assert not [call for call in exchange.calls[calls_before:] if call[0] in {"create_order", "cancel_order"}]
+    assert store.load_bracket_recovery(task_id)["status"] == "monitoring"
+
+
+def test_recovery_does_not_cancel_sibling_when_leg_was_user_canceled(tmp_path, monkeypatch):
+    executor, order, task_id, store, exchange = _placed_bracket_task(tmp_path, monkeypatch)
+    task = store.load_bracket_recovery(task_id)
+    stop_id, take_id = task["placed_ids"]
+    exchange.open_orders = []
+    exchange.orders_by_id = {
+        stop_id: {
+            "id": stop_id, "symbol": order.ccxt_symbol, "side": "sell",
+            "amount": order.quantity, "type": "market", "status": "canceled",
+            "info": {
+                "algoId": stop_id, "symbol": "BTCUSDT", "side": "SELL",
+                "algoStatus": "CANCELED", "orderType": "STOP_MARKET",
+                "triggerPrice": "48000", "quantity": str(order.quantity),
+                "reduceOnly": True,
+            },
+        },
+        take_id: {
+            "id": take_id, "symbol": order.ccxt_symbol, "side": "sell",
+            "amount": order.quantity, "type": "market", "status": "open",
+            "info": {
+                "algoId": take_id, "symbol": "BTCUSDT", "side": "SELL",
+                "algoStatus": "NEW", "orderType": "TAKE_PROFIT_MARKET",
+                "triggerPrice": "55000", "quantity": str(order.quantity),
+                "reduceOnly": True,
+            },
+        },
+    }
+
+    assert executor.monitor_bracket(task_id) == "monitoring"
+    assert not [call for call in exchange.calls if call[0] == "cancel_order"]
+    task = store.load_bracket_recovery(task_id)
+    assert task["legs"][0]["status"] == "cancelled"
+    assert task["legs"][1]["status"] == "placed"
+
+
 def test_completed_bracket_recovery_is_idempotent(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(fail_bracket_calls=1)
-    executor, _, task_id, _ = _failed_bracket_task(tmp_path, monkeypatch, exchange)
-    assert executor.recover_bracket(task_id) == "completed"
+    executor, _, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
+    assert executor.recover_bracket(task_id) == "monitoring"
+    current = store.load_bracket_recovery(task_id)
+    assert current["status"] == "monitoring"
+    assert [leg["status"] for leg in current["legs"]] == ["placed", "placed"]
     send_count = len([call for call in exchange.calls if call[0] == "create_order"])
 
-    assert executor.recover_bracket(task_id) == "completed"
+    assert executor.recover_bracket(task_id) == "monitoring"
     assert len([call for call in exchange.calls if call[0] == "create_order"]) == send_count
+
+
+def test_recovery_does_not_report_emergency_close_when_order_fails(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange(fail_bracket_calls=1)
+    executor, _, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
+    exchange.bracket_error = ccxt.ExchangeError("protective leg still unavailable")
+    exchange.emergency_error = ccxt.ExchangeError("emergency close refused")
+
+    assert executor.recover_bracket(task_id) == "emergency_close_failed"
+    task = store.load_bracket_recovery(task_id)
+    assert task["status"] == "emergency_close_failed"
+    assert "emergency close failed" in task["last_error"]
+    assert not any(event["action"] == "emergency_closed" for event in read_audit(tmp_path))
 
 
 def test_repeated_recovery_failure_emergency_closes_reduce_only(tmp_path, monkeypatch):
@@ -681,7 +962,7 @@ def test_repeated_recovery_failure_emergency_closes_reduce_only(tmp_path, monkey
     assert task["status"] == "emergency_closed"
     emergency = [call for call in exchange.calls if call[0] == "create_order"][-1]
     assert emergency[5]["reduceOnly"] is True
-    assert emergency[5]["clientOrderId"] == f"emergency:{task_id}"
+    assert emergency[5]["clientOrderId"].startswith("emergency-")
 
 
 def test_live_bracket_long_closes_sell_with_reduce_only(tmp_path, monkeypatch):

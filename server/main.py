@@ -23,6 +23,7 @@ from server import (
     approvals,
     audit,
     autoloop,
+    bracket_monitor,
     daily,
     db,
     health,
@@ -85,8 +86,6 @@ def _open_state_db() -> None:
     daily.reconcile()  # each reconciled orphan writes its own audit line
     runs.reconcile()
     job_store.reconcile_futures_cycles()
-    with suppress(Exception):
-        autoloop.recover_pending_brackets()
 
 
 @asynccontextmanager
@@ -98,7 +97,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     watchlist.ensure_seeded()
     with suppress(OSError):  # unreadable data dir must not keep the server down; the loop stays off
         autoloop.ensure_started()
-    yield
+    bracket_monitor.start()
+    try:
+        yield
+    finally:
+        bracket_monitor.stop()
 
 
 app = FastAPI(title="TradingAgents Control Panel", version="0.1.0", lifespan=lifespan)

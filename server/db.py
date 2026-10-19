@@ -26,7 +26,7 @@ from server import paths
 
 # Bumped when a migration below changes the shape; recorded in PRAGMA
 # user_version so a future release can tell which schema a file carries.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -114,7 +114,8 @@ CREATE TABLE IF NOT EXISTS bracket_recovery_tasks (
     status       TEXT NOT NULL DEFAULT 'pending',
     attempts     INTEGER NOT NULL DEFAULT 0,
     last_error   TEXT,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    venue_key    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_bracket_recovery_status ON bracket_recovery_tasks(status);
 
@@ -170,6 +171,9 @@ def _ensure_schema(conn: sqlite3.Connection, path: Path) -> None:
             conn.execute("ALTER TABLE futures_signal_claims ADD COLUMN completed_at TEXT")
         if "reason" not in claim_columns:
             conn.execute("ALTER TABLE futures_signal_claims ADD COLUMN reason TEXT")
+        bracket_columns = {row[1] for row in conn.execute("PRAGMA table_info(bracket_recovery_tasks)")}
+        if "venue_key" not in bracket_columns:
+            conn.execute("ALTER TABLE bracket_recovery_tasks ADD COLUMN venue_key TEXT")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         _initialized_for = path
 
