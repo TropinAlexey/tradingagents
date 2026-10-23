@@ -491,6 +491,8 @@ class TradingAgentsGraph:
             },
             "investment_plan": final_state["investment_plan"],
             "final_trade_decision": final_state["final_trade_decision"],
+            "futures_execution_intent": final_state.get("futures_execution_intent", "abstain"),
+            "futures_execution_proposal": final_state.get("futures_execution_proposal", {}),
         }
 
         # A ticker that would escape the results directory is rejected.

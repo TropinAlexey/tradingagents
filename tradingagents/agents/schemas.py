@@ -87,6 +87,14 @@ class TraderAction(str, Enum):
     SELL = "Sell"
 
 
+class FuturesExecutionIntent(str, Enum):
+    """Whether the final PM decision authorizes a new futures entry."""
+
+    ENTER = "enter"
+    MANAGE_EXISTING = "manage_existing"
+    ABSTAIN = "abstain"
+
+
 class FuturesExecutionProposal(BaseModel):
     """Agent-authored execution terms for one crypto futures opportunity."""
 
@@ -232,6 +240,13 @@ class TraderProposal(BaseModel):
         default=None,
         description="For a crypto futures trade, propose margin mode, leverage, risk and margin budgets, and protective levels. Omit when not trading futures.",
     )
+    futures_execution_intent: FuturesExecutionIntent = Field(
+        default=FuturesExecutionIntent.ABSTAIN,
+        description=(
+            "Choose enter only when opening a new futures position is authorized; choose "
+            "manage_existing for an existing-position reduction/exit; choose abstain otherwise."
+        ),
+    )
 
     @field_validator("entry_price", "stop_loss", "take_profit", mode="before")
     @classmethod
@@ -264,6 +279,10 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
         futures = proposal.futures_execution
         parts.extend([
             "",
+            f"**Futures Execution Intent**: {proposal.futures_execution_intent.value}",
+            f"**Futures Entry**: {futures.entry_price if futures.entry_price is not None else 'not provided'}",
+            f"**Futures Stop Loss**: {futures.stop_loss if futures.stop_loss is not None else 'not provided'}",
+            f"**Futures Take Profit**: {futures.take_profit if futures.take_profit is not None else 'not provided'}",
             f"**Futures Margin Mode**: {futures.margin_mode}",
             f"**Futures Leverage**: {futures.leverage}x",
             f"**Futures Risk Budget**: {futures.risk_fraction}",
@@ -273,6 +292,7 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
     else:
         parts.extend([
             "",
+            f"**Futures Execution Intent**: {proposal.futures_execution_intent.value}",
             "**Futures Execution**: not provided",
         ])
     parts.extend([
@@ -329,7 +349,15 @@ class PortfolioDecision(BaseModel):
     )
     futures_execution: FuturesExecutionProposal | None = Field(
         default=None,
-        description="Final agent-approved futures terms for a crypto position: margin mode, leverage, risk budget, margin budget, and entry/stop/target. Keep null for non-futures decisions or when the risk debate does not support a trade.",
+        description="Final agent-approved futures terms. Required only when futures_execution_intent is enter.",
+    )
+    futures_execution_intent: FuturesExecutionIntent = Field(
+        default=FuturesExecutionIntent.ABSTAIN,
+        description=(
+            "For crypto futures choose enter only when opening a new position is authorized "
+            "and all terms are supported; choose manage_existing for reduce/exit/protection "
+            "of an existing position; choose abstain when no futures entry is authorized."
+        ),
     )
 
     @field_validator("price_target", mode="before")
@@ -354,6 +382,7 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
         futures = decision.futures_execution
         parts.extend([
             "",
+            f"**Final Futures Execution Intent**: {decision.futures_execution_intent.value}",
             "**Final Futures Execution Decision**",
             f"- Margin Mode: {futures.margin_mode}",
             f"- Leverage: {futures.leverage}x",
@@ -365,7 +394,11 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
             f"- Rationale: {futures.rationale}",
         ])
     else:
-        parts.extend(["", "**Final Futures Execution Decision**: not provided"])
+        parts.extend([
+            "",
+            f"**Final Futures Execution Intent**: {decision.futures_execution_intent.value}",
+            "**Final Futures Execution Decision**: not provided",
+        ])
     return "\n".join(parts)
 
 

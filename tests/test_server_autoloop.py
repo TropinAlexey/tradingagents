@@ -1316,6 +1316,27 @@ def test_futures_worker_wiring_claims_and_skips_duplicate(tmp_path, monkeypatch)
     assert duplicate.reason == "duplicate futures signal skipped"
 
 
+def test_futures_intent_abstain_is_recorded_without_planning(monkeypatch):
+    result = autoloop_mod.DailyResult(ticker="BTC-USD")
+    context = _market_context()
+
+    class Derivatives(_NoopDerivatives):
+        def plan_order(self, *args, **kwargs):
+            pytest.fail("abstain intent must not plan an order")
+
+    monkeypatch.setattr(
+        autoloop_mod,
+        "_record_futures_cycle_rejection",
+        lambda *args, **kwargs: None,
+    )
+    autoloop_mod._process_futures_candidate(
+        Derivatives(), "BTC-USD", "Sell", {}, result,
+        context=context, proposal={}, intent="abstain",
+    )
+    assert result.plan is None
+    assert result.reason == "agent_abstained"
+
+
 def test_futures_entry_without_agent_proposal_is_refused():
     """The decision agents own the futures terms: without a proposal the cycle
     records the refusal instead of falling back to code-chosen leverage."""

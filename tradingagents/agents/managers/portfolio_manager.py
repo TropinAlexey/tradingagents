@@ -15,7 +15,11 @@ from tradingagents.agents.context import (
     get_language_instruction,
     get_portfolio_context_from_state,
 )
-from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
+from tradingagents.agents.schemas import (
+    FuturesExecutionIntent,
+    PortfolioDecision,
+    render_pm_decision,
+)
 from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
     bind_structured,
@@ -78,7 +82,7 @@ def create_portfolio_manager(llm):
 
 Ground every conclusion in specific evidence from the analysts. The risk debate always contains conflicting stances; deciding which is stronger is the job, so conflict alone is not a reason to Hold. Commit to the stronger case, sized by how decisively it wins. Choose Hold only when the evidence is still balanced after that weighing, or too thin to support a call; do not force a direction to appear decisive. Weigh the analysts on their merits, independent of speaking order.
 
-For a crypto futures decision, review the Trader's execution proposal against the full risk debate and the current account context. The Trader's terms are a proposal, not an instruction: you own the final choice of margin mode, leverage, risk_fraction, margin_fraction, entry, stop-loss, and take-profit. Choose isolated or cross explicitly. Prefer isolated unless the debate identifies a concrete account-level reason for cross margin. Do not maximize leverage; select it based on volatility, stop distance, the instrument's leverage tier, available margin, and expected reward/risk. Keep the risk budget consistent with your conviction and the evidence, not with the maximum amount the venue permits. Return a complete FuturesExecutionProposal only when the final rating is tradeable and a protective bracket is supported; otherwise leave it null. Explain the evidence behind the final terms. The execution system will validate your choice against independent hard limits and will reject it rather than silently substituting different values.
+For a crypto futures decision, review the Trader's execution proposal against the full risk debate and the current account context. The Trader's terms are a proposal, not an instruction: you own the final choice of margin mode, leverage, risk_fraction, margin_fraction, entry, stop-loss, and take-profit. Set futures_execution_intent to enter only when you authorize opening a new futures position and can provide a complete FuturesExecutionProposal. Set manage_existing when the rating is about reducing/exiting/protecting an existing position without opening a new one. Set abstain when no futures entry is authorized. Underweight and Sell are investment ratings, not automatic short-entry instructions. Do not maximize leverage; select it based on volatility, stop distance, the instrument's leverage tier, available margin, and expected reward/risk. The execution system will validate your choice against independent hard limits and will reject it rather than silently substituting different values.
 
 ## Output
 
@@ -87,10 +91,12 @@ Write these sections, in this order, starting with the rating on its own line:
 - **Rating**: exactly one of Buy / Overweight / Hold / Underweight / Sell
 - **Executive Summary**: the call and how to act on it
 - **Investment Thesis**: the evidence that decided it, and what would change it
+- **Futures Execution Intent**: enter / manage_existing / abstain (crypto futures only)
 
 {NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
 
         decision_holder = {}
+        fallback_holder = {}
         final_trade_decision = invoke_structured_or_freetext(
             structured_llm,
             llm,
@@ -98,6 +104,12 @@ Write these sections, in this order, starting with the rating on its own line:
             render_pm_decision,
             "Portfolio Manager",
             on_result=lambda decision: decision_holder.update(decision=decision),
+            on_fallback=lambda reason: fallback_holder.update(reason=reason),
+            structured_retry_instruction=(
+                "Return the PortfolioDecision schema now. Set futures_execution_intent to "
+                "enter, manage_existing, or abstain explicitly. If intent is enter, include "
+                "a complete FuturesExecutionProposal; never put execution terms only in prose."
+            ) if futures_context else None,
         )
 
         new_risk_debate_state = {
@@ -120,8 +132,14 @@ Write these sections, in this order, starting with the rating on its own line:
                 decision_holder["decision"].futures_execution.model_dump()
                 if futures_context
                 and decision_holder.get("decision") is not None
+                and decision_holder["decision"].futures_execution_intent == FuturesExecutionIntent.ENTER
                 and decision_holder["decision"].futures_execution is not None
                 else {}
+            ),
+            "futures_execution_intent": (
+                decision_holder["decision"].futures_execution_intent.value
+                if futures_context and decision_holder.get("decision") is not None
+                else "structured_terms_unavailable" if futures_context and fallback_holder else "abstain"
             ),
         }
 

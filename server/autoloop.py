@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 import os
 import queue
 import threading
@@ -662,6 +663,26 @@ def _process_candidate(
                 state.get("futures_execution_proposal")
                 if isinstance(state, dict) else None
             )
+            intent = (
+                state.get("futures_execution_intent")
+                if isinstance(state, dict) else None
+            )
+            if intent is None:
+                intent = "enter" if isinstance(proposal, dict) and proposal else "structured_terms_unavailable"
+            if intent != "enter":
+                result.reason = {
+                    "abstain": "agent_abstained",
+                    "manage_existing": "position_management_only",
+                    "structured_terms_unavailable": "structured_terms_unavailable",
+                }.get(str(intent), f"invalid_futures_intent: {intent}")
+                _record_futures_cycle_rejection(
+                    ticker,
+                    unified_symbol=futures_context.get("unified_symbol"),
+                    signal=signal,
+                    signal_reason=result.reason,
+                    phase="proposal",
+                )
+                return result
             with telemetry.span("futures_planning", ticker):
                 _process_futures_candidate(
                     derivatives, ticker, signal, config, result,
@@ -942,14 +963,22 @@ def _proposal_terms(
     if not isinstance(proposal, dict) or not proposal:
         return None, "agent_proposal_missing: no futures entry without agent execution terms"
     margin_mode = str(proposal.get("margin_mode") or "").strip().lower()
+    rationale = str(proposal.get("rationale") or "").strip()
+    if not rationale:
+        return None, "agent_proposal_rejected: rationale is required"
     if margin_mode not in ("isolated", "cross"):
         return None, f"agent_proposal_rejected: margin_mode {margin_mode!r} is not isolated/cross"
     try:
-        leverage = float(proposal["leverage"])
+        leverage_raw = proposal["leverage"]
+        leverage = float(leverage_raw)
         risk_fraction = float(proposal["risk_fraction"])
         margin_fraction = float(proposal["margin_fraction"])
     except (KeyError, TypeError, ValueError):
         return None, "agent_proposal_rejected: leverage, risk_fraction and margin_fraction are required"
+    if not isinstance(leverage_raw, int) or isinstance(leverage_raw, bool):
+        return None, "agent_proposal_rejected: leverage must be an integer"
+    if not all(math.isfinite(value) for value in (leverage, risk_fraction, margin_fraction)):
+        return None, "agent_proposal_rejected: numeric terms must be finite"
     if leverage < 1 or leverage > MAX_AUTO_LEVERAGE:
         return None, (
             f"agent_proposal_rejected: leverage {leverage:g}x is outside "
@@ -967,6 +996,16 @@ def _proposal_terms(
             f"agent_proposal_rejected: margin_fraction {margin_fraction:g} is outside "
             f"0-{margin_cap:g}"
         )
+    entry = proposal.get("entry_price")
+    if entry is not None:
+        try:
+            entry_value = float(entry)
+        except (TypeError, ValueError):
+            return None, "agent_proposal_rejected: entry_price is not a number"
+        if not math.isfinite(entry_value) or entry_value <= 0:
+            return None, "agent_proposal_rejected: entry_price must be positive and finite"
+        if abs(entry_value - mark) > max(mark * 0.001, 1e-12):
+            return None, "agent_proposal_rejected: non-market entry_price is unsupported by autoloop"
     stop = proposal.get("stop_loss")
     take = proposal.get("take_profit")
     if (stop is not None) != (take is not None):
@@ -1000,7 +1039,7 @@ def _proposal_terms(
 def _process_futures_candidate(
     derivatives: Any, ticker: str, signal: str, config: dict, result: DailyResult,
     *, context: dict | None = None, proposal: Any = None, portfolio: Any = None,
-    brackets: dict | None = None,
+    brackets: dict | None = None, intent: str | None = None,
     deadline: float | None = None,
     cancelled: threading.Event | None = None,
     execution_lock: threading.Lock | None = None,
@@ -1021,6 +1060,22 @@ def _process_futures_candidate(
         return
     candle_1h = context["one_hour"]
     candle_4h = context["four_hour"]
+    if intent is None:
+        intent = "enter"
+    if intent != "enter":
+        result.reason = {
+            "abstain": "agent_abstained",
+            "manage_existing": "position_management_only",
+            "structured_terms_unavailable": "structured_terms_unavailable",
+        }.get(str(intent), f"invalid_futures_intent: {intent}")
+        _record_futures_cycle_rejection(
+            ticker,
+            unified_symbol=context.get("unified_symbol"),
+            signal=signal,
+            signal_reason=result.reason,
+            phase="proposal",
+        )
+        return
     direction = _direction(signal)
     confirmation_ok, confirmation_reason = _confirmation_state(context, signal)
     if not confirmation_ok:

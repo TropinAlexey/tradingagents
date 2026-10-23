@@ -56,6 +56,15 @@ def bind_structured(llm: Any, schema: type[T], agent_name: str) -> Any | None:
         return None
 
 
+def _retry_prompt(prompt: Any, instruction: str) -> Any:
+    """Append a machine-output retry instruction without changing the original prompt."""
+    if isinstance(prompt, list):
+        return [*prompt, {"role": "user", "content": instruction}]
+    if isinstance(prompt, str):
+        return f"{prompt}\n\n{instruction}"
+    return prompt
+
+
 def invoke_structured_or_freetext(
     structured_llm: Any | None,
     plain_llm: Any,
@@ -64,30 +73,45 @@ def invoke_structured_or_freetext(
     agent_name: str,
     *,
     on_result: Callable[[T], None] | None = None,
+    on_fallback: Callable[[str], None] | None = None,
+    structured_retry_instruction: str | None = None,
 ) -> str:
-    """Run the structured call and render to markdown; fall back to free-text on any failure.
+    """Run structured output, retry its machine contract once, then report-only prose.
 
-    ``prompt`` is whatever the underlying LLM accepts (a string for chat
-    invocations, a list of message dicts for chat models that take that
-    shape). The same value is forwarded to the free-text path so the
-    fallback sees the same input the structured call did.
+    ``on_result`` runs only after rendering succeeds, so a failed renderer cannot
+    leave a stale typed proposal alongside fallback text. ``on_fallback`` lets a
+    caller mark prose as non-executable. The optional retry instruction is used by
+    decision agents whose typed result controls a side effect; it never extracts
+    execution terms from prose.
     """
+    structured_error: Exception | None = None
     if structured_llm is not None:
-        try:
-            result = structured_llm.invoke(prompt)
-            if result is None:
-                # A thinking model can answer in plain text instead of calling
-                # the tool, leaving the parser with nothing to return. Treat it
-                # as a structured miss and fall back, with a clear reason.
-                raise ValueError("structured output returned no parsed result")
-            if on_result is not None:
-                on_result(result)
-            return render(result)
-        except Exception as exc:
-            logger.warning(
-                "%s: structured-output invocation failed (%s); retrying once as free text",
-                agent_name, exc,
-            )
+        attempts = [prompt]
+        if structured_retry_instruction:
+            attempts.append(_retry_prompt(prompt, structured_retry_instruction))
+        for attempt, structured_prompt in enumerate(attempts, start=1):
+            try:
+                result = structured_llm.invoke(structured_prompt)
+                if result is None:
+                    raise ValueError("structured output returned no parsed result")
+                rendered = render(result)
+                if on_result is not None:
+                    on_result(result)
+                return rendered
+            except Exception as exc:
+                structured_error = exc
+                logger.warning(
+                    "%s: structured-output invocation failed on attempt %d/%d "
+                    "(%s); %s",
+                    agent_name,
+                    attempt,
+                    len(attempts),
+                    type(exc).__name__,
+                    "retrying structured output" if attempt < len(attempts)
+                    else "falling back to report-only free text",
+                )
 
+    if on_fallback is not None:
+        on_fallback(type(structured_error).__name__ if structured_error else "unsupported")
     response = plain_llm.invoke(prompt)
     return response.content

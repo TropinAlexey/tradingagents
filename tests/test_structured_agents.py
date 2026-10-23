@@ -8,6 +8,7 @@ so they share the same deterministic output shape.
 """
 
 import inspect
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -97,7 +98,44 @@ class TestRenderTraderProposal:
 
 
 @pytest.mark.unit
-def test_portfolio_manager_returns_the_final_futures_execution_decision():
+def test_portfolio_manager_emits_explicit_abstain_intent_without_terms():
+    from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
+
+    risk = {
+        "history": "Risk debate rejects a new short entry.",
+        "aggressive_history": "aggressive",
+        "conservative_history": "conservative",
+        "neutral_history": "neutral",
+        "current_aggressive_response": "",
+        "current_conservative_response": "",
+        "current_neutral_response": "",
+        "latest_speaker": "Neutral",
+        "count": 3,
+    }
+    structured = MagicMock()
+    structured.invoke.return_value = PortfolioDecision(
+        rating=PortfolioRating.UNDERWEIGHT,
+        executive_summary="Reduce existing exposure only.",
+        investment_thesis="No defensible new futures entry.",
+        futures_execution_intent="manage_existing",
+    )
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+
+    result = create_portfolio_manager(llm)({
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "execution_context": "Futures equity: 1000 USDT; available margin: 700 USDT.",
+        "risk_debate_state": risk,
+        "investment_plan": "Reduce exposure if already held.",
+        "trader_investment_plan": "Do not open a new short.",
+    })
+
+    assert result["futures_execution_intent"] == "manage_existing"
+    assert result["futures_execution_proposal"] == {}
+    assert "manage_existing" in result["final_trade_decision"]
+
+
     from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 
     risk = {
@@ -126,6 +164,7 @@ def test_portfolio_manager_returns_the_final_futures_execution_decision():
         executive_summary="Buy with isolated 2x and a defined bracket.",
         investment_thesis="The risk debate supports the setup.",
         futures_execution=proposal,
+        futures_execution_intent="enter",
     )
     llm = MagicMock()
     llm.with_structured_output.return_value = structured
@@ -266,21 +305,54 @@ def _structured_trader_llm(captured: dict, proposal: TraderProposal | None = Non
 
 
 @pytest.mark.unit
-def test_invoke_structured_falls_back_when_result_is_none():
-    # A thinking model can answer in plain text, leaving the parser with None.
-    # That must fall back to free text, not crash on render(None) (#1051).
+def test_invoke_structured_retries_json_decode_and_commits_after_render():
+    from tradingagents.agents.structured import invoke_structured_or_freetext
+
+    structured = MagicMock()
+    expected = MagicMock(rating="Buy")
+    structured.invoke.side_effect = [
+        json.JSONDecodeError("empty", "", 0),
+        expected,
+    ]
+    plain = MagicMock()
+    committed = []
+
+    out = invoke_structured_or_freetext(
+        structured,
+        plain,
+        "prompt",
+        render=lambda result: result.rating,
+        agent_name="Portfolio Manager",
+        on_result=committed.append,
+        structured_retry_instruction="return schema",
+    )
+
+    assert out == "Buy"
+    assert structured.invoke.call_count == 2
+    assert committed == [expected]
+    plain.invoke.assert_not_called()
+
+
+@pytest.mark.unit
+def test_invoke_structured_fallback_reports_non_executable_status():
     from tradingagents.agents.structured import invoke_structured_or_freetext
 
     structured = MagicMock()
     structured.invoke.return_value = None
     plain = MagicMock()
-    plain.invoke.return_value = MagicMock(content="FREETEXT")
+    plain.invoke.return_value = MagicMock(content="prose")
+    fallback = []
 
-    out = invoke_structured_or_freetext(
-        structured, plain, "prompt", render=lambda r: r.rating, agent_name="t"
-    )
-    assert out == "FREETEXT"
-    plain.invoke.assert_called_once()
+    assert invoke_structured_or_freetext(
+        structured,
+        plain,
+        "prompt",
+        render=lambda result: result,
+        agent_name="Portfolio Manager",
+        on_fallback=fallback.append,
+        structured_retry_instruction="return schema",
+    ) == "prose"
+    assert fallback == ["ValueError"]
 
 
 @pytest.mark.unit
