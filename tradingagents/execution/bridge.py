@@ -838,6 +838,8 @@ class ExchangeBridge:
         }
         if event["market"] == "derivatives" and getattr(order, "cost", None) is not None:
             event["cost"] = order.cost
+        if getattr(order, "margin_mode", None) is not None:
+            event["margin_mode"] = order.margin_mode
         if getattr(order, "stop_loss", None) is not None:
             event["stop_loss"] = order.stop_loss
         if getattr(order, "take_profit", None) is not None:

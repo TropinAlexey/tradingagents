@@ -19,8 +19,8 @@ from fastapi.testclient import TestClient
 
 from server import (
     approvals as approvals_mod,
+    control_store,
     daily as daily_mod,
-    paths as server_paths,
     portfolio as portfolio_mod,
     runs as runs_mod,
     settings as settings_mod,
@@ -88,7 +88,7 @@ def _today() -> str:
 
 
 @pytest.fixture(autouse=True)
-def _server_state(tmp_path, monkeypatch):
+def _server_state(tmp_path, monkeypatch, postgres_schema):
     """Point all server state at tmp and start every test with an empty registry.
 
     ``watchlist._save_state`` deliberately syncs ``DEFAULT_CONFIG
@@ -99,11 +99,6 @@ def _server_state(tmp_path, monkeypatch):
     from tradingagents.default_config import DEFAULT_CONFIG
 
     saved_watchlist = DEFAULT_CONFIG.get("exec_watchlist")
-    monkeypatch.setattr(server_paths, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
-    monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
-    monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
-    monkeypatch.setattr(server_paths, "OPERATOR_CONFIG_PATH", tmp_path / "operator_config.json")
     monkeypatch.setattr(runs_mod, "_runs", {})
     monkeypatch.setattr(daily_mod, "_jobs", {})
     set_config({"exec_live": False})
@@ -616,7 +611,7 @@ def test_approve_dry_fills_and_resolves_item(client, tmp_path, monkeypatch):
     assert again.status_code == 409
     assert again.json()["error"]["code"] == "conflict"
 
-    trail = (tmp_path / "server-audit.jsonl").read_text(encoding="utf-8")
+    trail = "\n".join(json.dumps(e) for e in control_store.load_server_audit())
     assert "approval_granted" in trail
     assert "approval_executed" in trail
     engine_log = (tmp_path / "engine-audit.jsonl").read_text(encoding="utf-8")
@@ -767,7 +762,7 @@ def test_reject_records_reason_and_never_takes_the_gate(client, tmp_path):
     assert body["resolution"] == "too expensive"
     assert body["resolved_at"]
 
-    trail = (tmp_path / "server-audit.jsonl").read_text(encoding="utf-8")
+    trail = "\n".join(json.dumps(e) for e in control_store.load_server_audit())
     assert "approval_denied" in trail
 
     again = client.post(f"/api/approvals/{item['id']}/reject", json={})

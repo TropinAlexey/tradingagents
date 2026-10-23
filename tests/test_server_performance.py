@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from server import paths as server_paths, performance as performance_mod
+from server import performance as performance_mod
 from server.contract import install_error_handlers
 from tradingagents.dataflows.config import set_config
 
@@ -62,16 +62,12 @@ def _no_network(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _server_state(tmp_path, monkeypatch):
+def _server_state(tmp_path, monkeypatch, postgres_schema):
     """Point the server's file state at tmp (TestClient's lifespan seeds the
     watchlist, so the real server/data/ must stay untouched)."""
     from tradingagents.default_config import DEFAULT_CONFIG
 
     saved_watchlist = DEFAULT_CONFIG.get("exec_watchlist")
-    monkeypatch.setattr(server_paths, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
-    monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
-    monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
     yield
     DEFAULT_CONFIG["exec_watchlist"] = saved_watchlist
 

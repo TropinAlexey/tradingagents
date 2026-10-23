@@ -62,6 +62,8 @@ def invoke_structured_or_freetext(
     prompt: Any,
     render: Callable[[T], str],
     agent_name: str,
+    *,
+    on_result: Callable[[T], None] | None = None,
 ) -> str:
     """Run the structured call and render to markdown; fall back to free-text on any failure.
 
@@ -78,6 +80,8 @@ def invoke_structured_or_freetext(
                 # the tool, leaving the parser with nothing to return. Treat it
                 # as a structured miss and fall back, with a clear reason.
                 raise ValueError("structured output returned no parsed result")
+            if on_result is not None:
+                on_result(result)
             return render(result)
         except Exception as exc:
             logger.warning(

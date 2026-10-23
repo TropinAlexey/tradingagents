@@ -17,6 +17,7 @@ from tradingagents.agents.analysts.sentiment_analyst import create_sentiment_ana
 from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 from tradingagents.agents.managers.research_manager import create_research_manager
 from tradingagents.agents.schemas import (
+    FuturesExecutionProposal,
     PortfolioDecision,
     PortfolioRating,
     ResearchPlan,
@@ -69,6 +70,77 @@ class TestRenderTraderProposal:
         for field in ("Entry Price", "Stop Loss", "Position Sizing"):
             assert f"**{field}**: not provided" in md
         assert "FINAL TRANSACTION PROPOSAL: **SELL**" in md
+
+    def test_futures_proposal_fields_are_rendered_for_risk_debate(self):
+        p = TraderProposal(
+            action=TraderAction.BUY,
+            reasoning="The confirmed trend has room to run.",
+            entry_price=100,
+            stop_loss=96,
+            take_profit=108,
+            futures_execution=FuturesExecutionProposal(
+                margin_mode="isolated",
+                leverage=2,
+                risk_fraction=0.005,
+                margin_fraction=0.2,
+                rationale="A 4% invalidation distance supports 2x within the account cap.",
+            ),
+        )
+
+        rendered = render_trader_proposal(p)
+
+        assert "**Take Profit**: 108.0" in rendered
+        assert "**Futures Margin Mode**: isolated" in rendered
+        assert "**Futures Leverage**: 2x" in rendered
+        assert "**Futures Risk Budget**: 0.005" in rendered
+        assert "A 4% invalidation distance" in rendered
+
+
+@pytest.mark.unit
+def test_portfolio_manager_returns_the_final_futures_execution_decision():
+    from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
+
+    risk = {
+        "history": "Risk debate favors isolated 2x with a 0.5% risk budget.",
+        "aggressive_history": "aggressive",
+        "conservative_history": "conservative",
+        "neutral_history": "neutral",
+        "current_aggressive_response": "",
+        "current_conservative_response": "",
+        "current_neutral_response": "",
+        "latest_speaker": "Neutral",
+        "count": 3,
+    }
+    proposal = FuturesExecutionProposal(
+        margin_mode="isolated",
+        leverage=2,
+        risk_fraction=0.005,
+        margin_fraction=0.2,
+        stop_loss=96,
+        take_profit=108,
+        rationale="Closed 1h and 4h confirmation, isolated collateral, and 0.5% risk.",
+    )
+    structured = MagicMock()
+    structured.invoke.return_value = PortfolioDecision(
+        rating=PortfolioRating.BUY,
+        executive_summary="Buy with isolated 2x and a defined bracket.",
+        investment_thesis="The risk debate supports the setup.",
+        futures_execution=proposal,
+    )
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+
+    result = create_portfolio_manager(llm)({
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "execution_context": "Futures equity: 1000 USDT; available margin: 700 USDT.",
+        "risk_debate_state": risk,
+        "investment_plan": "Buy after aligned confirmation.",
+        "trader_investment_plan": "Trader proposal.",
+    })
+
+    assert result["futures_execution_proposal"] == proposal.model_dump()
+    assert "Futures equity: 1000 USDT" in str(structured.invoke.call_args.args[0])
 
 
 @pytest.mark.unit
@@ -253,6 +325,25 @@ class TestTraderAgent:
         assert "14-day ATR 4.2" in user            # the actual report content reached the Trader
         assert "support $178, resistance $196" in user
         assert "Ground concrete price levels" in system
+
+    def test_prompt_includes_futures_account_and_market_context(self):
+        captured = {}
+        state = {
+            **_make_trader_state(),
+            "asset_type": "crypto",
+            "execution_context": (
+                "Futures equity: 1000 USDT; available margin: 700 USDT; "
+                "1h and 4h candles confirmed bullish; ATR: 3.2%."
+            ),
+        }
+
+        create_trader(_structured_trader_llm(captured))(state)
+
+        user = " ".join(m["content"] for m in captured["prompt"] if m["role"] == "user")
+        system = " ".join(m["content"] for m in captured["prompt"] if m["role"] == "system")
+        assert "Futures equity: 1000 USDT" in user
+        assert "ATR: 3.2%" in user
+        assert "propose margin mode, leverage, risk budget, and" in system
 
     def test_empty_market_report_omits_the_section_and_grounding(self):
         # #1167: when the market analyst wasn't selected the report is empty, so
@@ -545,4 +636,6 @@ def test_the_trader_names_the_levels_it_did_not_give():
     rendered = render_trader_proposal(TraderProposal(action=TraderAction.HOLD, reasoning="r"))
     for field in ("Entry Price", "Stop Loss", "Position Sizing"):
         assert field in rendered
-    assert rendered.lower().count("not provided") == 3
+    # Entry/stop/take-profit/position-sizing plus the futures-execution line
+    # all name themselves even when the model omitted them.
+    assert rendered.lower().count("not provided") == 5

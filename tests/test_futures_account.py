@@ -76,6 +76,7 @@ def test_read_futures_account_normalizes_positions_and_account_values():
     position = snapshot.positions[0]
     assert position.symbol == "INJ/USDT:USDT"
     assert position.side == "short"
+    assert position.contracts == pytest.approx(12.0)
     assert position.quantity == pytest.approx(-12.0)
     assert position.notional == pytest.approx(288.0)
     assert position.margin == pytest.approx(96.0)

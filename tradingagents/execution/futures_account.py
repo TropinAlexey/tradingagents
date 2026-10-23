@@ -277,6 +277,19 @@ def _futures_params(exchange_id: str, config: dict) -> tuple[dict[str, str], dic
     raise ValueError(f"futures account reads are not configured for {exchange_id!r}")
 
 
+def read_futures_positions(bridge) -> tuple[FuturesPosition, ...]:
+    """Read and normalize only the configured derivatives positions."""
+    client = bridge.client()
+    exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
+    _, position_params = _futures_params(exchange_id, bridge.config)
+    positions = client.fetch_positions(None, params=position_params)
+    if not isinstance(positions, list):
+        raise ValueError("exchange returned an invalid futures positions response")
+    return tuple(
+        position for raw in positions if (position := _normalize_position(raw, client)) is not None
+    )
+
+
 def read_futures_account(bridge) -> FuturesAccountSnapshot:
     """Read the configured futures account without changing client mode or state.
 
@@ -286,15 +299,12 @@ def read_futures_account(bridge) -> FuturesAccountSnapshot:
     client = bridge.client()
     exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
     profile = _venue_profile(bridge)
-    balance_params, position_params = _futures_params(exchange_id, bridge.config)
+    balance_params, _ = _futures_params(exchange_id, bridge.config)
 
     balance = client.fetch_balance(params=balance_params)
-    positions = client.fetch_positions(None, params=position_params)
-    if not isinstance(balance, dict) or not isinstance(positions, list):
+    if not isinstance(balance, dict):
         raise ValueError("exchange returned an invalid futures account response")
-    normalized = tuple(
-        position for raw in positions if (position := _normalize_position(raw, client)) is not None
-    )
+    normalized = read_futures_positions(bridge)
     values = _account_values(balance, exchange_id)
     return FuturesAccountSnapshot(
         equity=values["equity"],

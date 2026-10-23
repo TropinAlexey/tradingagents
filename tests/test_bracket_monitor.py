@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from server import bracket_monitor, db, job_store, paths
+from server import bracket_monitor, job_store
 from tradingagents.dataflows.config import set_config
 from tradingagents.execution import derivatives as derivatives_mod
 
@@ -12,9 +12,7 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
-def monitor_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(paths, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(db, "_initialized_for", None)
+def monitor_state(tmp_path, monkeypatch, postgres_schema):
     set_config({"exec_derivatives": False, "exec_live": False})
     monkeypatch.delenv("TRADINGAGENTS_EXEC_DERIVATIVES", raising=False)
     monkeypatch.delenv("TRADINGAGENTS_EXEC_LIVE", raising=False)
@@ -287,8 +285,10 @@ def test_lifespan_starts_and_stops_monitor_with_other_lifecycle_hooks(monkeypatc
     monkeypatch.setattr(main, "_open_state_db", lambda: calls.append("database"))
     monkeypatch.setattr(main.watchlist, "ensure_seeded", lambda: calls.append("watchlist"))
     monkeypatch.setattr(main.autoloop, "ensure_started", lambda: calls.append("autoloop"))
-    monkeypatch.setattr(main.bracket_monitor, "start", lambda: calls.append("monitor-start"))
-    monkeypatch.setattr(main.bracket_monitor, "stop", lambda: calls.append("monitor-stop"))
+    monkeypatch.setattr(main.bracket_monitor, "start", lambda: calls.append("bracket-monitor-start"))
+    monkeypatch.setattr(main.bracket_monitor, "stop", lambda: calls.append("bracket-monitor-stop"))
+    monkeypatch.setattr(main.position_monitor, "start", lambda: calls.append("position-monitor-start"))
+    monkeypatch.setattr(main.position_monitor, "stop", lambda: calls.append("position-monitor-stop"))
 
     async def exercise_lifespan():
         async with main.lifespan(None):
@@ -304,11 +304,15 @@ def test_lifespan_starts_and_stops_monitor_with_other_lifecycle_hooks(monkeypatc
         exit_lifespan.send(None)
 
     assert calls == [
-        "config",
+        # Migrations first: operator overrides are read from PostgreSQL, so the
+        # table must exist before the config is applied.
         "database",
+        "config",
         "watchlist",
         "autoloop",
-        "monitor-start",
+        "bracket-monitor-start",
+        "position-monitor-start",
         "yield",
-        "monitor-stop",
+        "position-monitor-stop",
+        "bracket-monitor-stop",
     ]

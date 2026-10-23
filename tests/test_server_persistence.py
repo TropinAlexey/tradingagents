@@ -22,9 +22,7 @@ from fastapi.testclient import TestClient
 
 from server import (
     daily as daily_mod,
-    db as db_mod,
     job_store,
-    paths as server_paths,
     run_store,
     runs as runs_mod,
 )
@@ -81,17 +79,12 @@ def _today() -> str:
 
 
 @pytest.fixture(autouse=True)
-def _server_state(tmp_path, monkeypatch):
+def _server_state(tmp_path, monkeypatch, postgres_schema):
     """Point all server state — files and database — at tmp."""
-    monkeypatch.setattr(server_paths, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
-    monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
-    monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
     monkeypatch.setattr(runs_mod, "_runs", {})
     monkeypatch.setattr(daily_mod, "_jobs", {})
     # Each test gets a fresh file, so the once-per-path schema guard must reset
     # with it — otherwise the second test would skip CREATE TABLE on a new file.
-    monkeypatch.setattr(db_mod, "_initialized_for", None)
 
 
 @pytest.fixture()
@@ -237,6 +230,31 @@ def test_job_and_its_agent_output_survive_a_restart(client, tmp_path):
     assert result["plan"]["side"] == "buy"  # the plan the agent produced, in full
     assert result["approval_id"]
     assert result["mock_source"].startswith("replay:")
+
+
+def test_finish_persists_terminal_row_before_exposing_it(monkeypatch):
+    """The API reads the live job first: flipping its status terminal before
+    the database write lets a poll see "completed" while the restart record
+    still says "running"."""
+    job = daily_mod.DailyJobState(
+        job_id="d_order", mode="mock", tickers=["BTC-USD"],
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    job.status = "running"
+    observed: list[tuple[str, str]] = []
+    real_persist = job_store.persist
+
+    def spy(payload):
+        observed.append((payload["status"], job.status))
+        real_persist(payload)
+
+    monkeypatch.setattr(daily_mod.job_store, "persist", spy)
+
+    daily_mod._finish(job)
+
+    assert observed == [("completed", "running")]
+    assert job.status == "completed"
+    assert job_store.load("d_order")["status"] == "completed"
 
 
 def test_job_progress_heartbeat_and_current_ticker_survive_restart(client):

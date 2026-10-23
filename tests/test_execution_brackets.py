@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import ccxt
 import pytest
 
-from server import db, job_store, paths
+from server import job_store
 from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.sizing import PlannedOrder
 
@@ -14,11 +14,8 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture(autouse=True)
-def isolated_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(paths, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(db, "_initialized_for", None)
-
-
+def isolated_db(tmp_path, monkeypatch, postgres_schema):
+    return postgres_schema
 class _Exchange:
     def __init__(self):
         self.calls = []
@@ -151,6 +148,180 @@ def test_cancel_failure_retries_only_sibling_after_restart():
     assert fresh_manager.reconcile(task_id, repair_missing=False, allow_sibling_cancel=True) == "reconciled_take_profit"
     assert [call[1] for call in exchange.calls if call[0] == "cancel"] == ["1", "1"]
     assert len([call for call in exchange.calls if call[0] == "create"]) == 2
+
+
+def test_replacing_leg_places_and_persists_new_order_before_canceling_old():
+    manager, bridge, exchange, task_id = _bracket()
+    original_task = job_store.load_bracket_recovery(task_id)
+    old_stop_id = original_task["legs"][0]["order_id"]
+
+    status = manager.replace_leg(
+        task_id, "stop-loss", trigger_price=49_000, quantity=0.005,
+        allow_mutation=True,
+    )
+
+    task = job_store.load_bracket_recovery(task_id)
+    new_stop_id = task["legs"][0]["order_id"]
+    calls = [call[0:2] for call in exchange.calls]
+    assert status == "replaced"
+    assert new_stop_id != old_stop_id
+    assert task["legs"][0]["params"] == {"stopLossPrice": 49_000}
+    assert calls.index(("create", "BTC/USDT:USDT")) < calls.index(("cancel", old_stop_id))
+    assert old_stop_id not in [order["id"] for order in exchange.fetch_open_orders("BTC/USDT:USDT")]
+
+
+def test_replacing_leg_refuses_to_cancel_a_triggering_or_filled_order():
+    manager, bridge, exchange, task_id = _bracket()
+    task = job_store.load_bracket_recovery(task_id)
+    old_stop_id = task["legs"][0]["order_id"]
+    exchange.orders[old_stop_id]["info"]["algoStatus"] = "TRIGGERING"
+    calls_before = len(exchange.calls)
+
+    assert manager.replace_leg(
+        task_id, "stop-loss", trigger_price=49_000, quantity=0.005,
+        allow_mutation=True,
+    ) == "leg_triggering"
+    new_calls = exchange.calls[calls_before:]
+    assert not [call for call in new_calls if call[0] in {"create", "cancel"}]
+
+
+def test_uncertain_replacement_is_adopted_after_restart_without_duplicate_submit():
+    class _TimeoutAfterAccept(_Exchange):
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            response = super().create_order(symbol, kind, side, amount, price, params)
+            if params and params.get("stopLossPrice") == 49_000:
+                raise ccxt.RequestTimeout("replacement acknowledgement lost")
+            return response
+
+    exchange = _TimeoutAfterAccept()
+    manager, bridge, exchange, task_id = _bracket(exchange)
+    old_stop_id = job_store.load_bracket_recovery(task_id)["legs"][0]["order_id"]
+
+    assert manager.replace_leg(
+        task_id, "stop-loss", trigger_price=49_000, quantity=0.005,
+        allow_mutation=True,
+    ) == "submission_uncertain"
+    submissions = len([call for call in exchange.calls if call[0] == "create"])
+
+    recovered = BracketManager(bridge)
+    assert recovered.reconcile(
+        task_id, repair_missing=False, allow_sibling_cancel=True,
+    ) == "monitoring"
+
+    task = job_store.load_bracket_recovery(task_id)
+    assert task["legs"][0]["params"] == {"stopLossPrice": 49_000}
+    assert task["legs"][0]["order_id"] != old_stop_id
+    assert len([call for call in exchange.calls if call[0] == "create"]) == submissions
+    assert [call[1] for call in exchange.calls if call[0] == "cancel"].count(old_stop_id) == 1
+
+
+def test_binance_conditional_orders_use_mark_price_trigger_source():
+    _manager, _bridge, exchange, _task_id = _bracket()
+
+    conditional_calls = [
+        call for call in exchange.calls
+        if call[0] == "create" and call[4]
+    ]
+
+    assert all(call[4]["workingType"] == "MARK_PRICE" for call in conditional_calls)
+
+
+def test_replacement_below_minimum_stop_move_is_ignored():
+    manager, _bridge, _exchange, task_id = _bracket()
+
+    status = manager.replace_leg(
+        task_id, "stop-loss", trigger_price=48_005, quantity=0.005,
+        allow_mutation=True, min_stop_move=10.0,
+    )
+
+    assert status == "below_minimum_stop_move"
+
+
+class _LadderExchange(_Exchange):
+    """Adds the position read the ladder settlement needs."""
+
+    def __init__(self, contracts):
+        super().__init__()
+        self.contracts = contracts
+
+    def fetch_positions(self, symbols=None, params=None):
+        return [{
+            "symbol": "BTC/USDT:USDT", "side": "long", "contracts": self.contracts,
+            "entryPrice": 50_000.0, "markPrice": 50_000.0,
+        }]
+
+    def market(self, symbol):
+        return {"quote": "USDT", "settle": "USDT", "inverse": False}
+
+
+def _ladder(contracts=0.005):
+    exchange = _LadderExchange(contracts)
+    bridge = _Bridge(exchange)
+    order = PlannedOrder(
+        ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", market="derivatives",
+        signal="Buy", side="buy", quantity=contracts, estimated_price=50_000,
+        cost=250, stop_loss=48_000, take_profit=55_000,
+    )
+    manager = BracketManager(bridge)
+    manager.place_ladder(
+        order, [(52_000.0, 0.00165), (54_000.0, 0.00165)], True, "entry-1",
+    )
+    return manager, bridge, exchange, f"bracket:{order.ccxt_symbol}:entry-1"
+
+
+def test_ladder_places_full_size_stop_and_partial_targets():
+    _manager, _bridge, exchange, _task_id = _ladder()
+
+    creates = [call for call in exchange.calls if call[0] == "create"]
+    assert [(call[2], call[3]) for call in creates] == [
+        ("sell", 0.005), ("sell", 0.00165), ("sell", 0.00165),
+    ]
+    assert [call[4].get("stopLossPrice") for call in creates] == [48_000, None, None]
+    assert [call[4].get("takeProfitPrice") for call in creates] == [None, 52_000, 54_000]
+    assert all(call[4]["workingType"] == "MARK_PRICE" for call in creates)
+
+
+def test_filled_tranche_keeps_the_rest_of_the_ladder_and_resizes_the_stop():
+    manager, _bridge, exchange, task_id = _ladder()
+    task = job_store.load_bracket_recovery(task_id)
+    first_tp = next(leg for leg in task["legs"] if leg["name"] == "take-profit-1")
+    exchange.orders[first_tp["order_id"]]["info"]["algoStatus"] = "FINISHED"
+    exchange.contracts = 0.00335  # 0.005 - 0.00165 after the first tranche
+    calls_before = len(exchange.calls)
+
+    status = manager.reconcile(task_id, repair_missing=False, allow_sibling_cancel=True)
+
+    task = job_store.load_bracket_recovery(task_id)
+    stop = next(leg for leg in task["legs"] if leg["name"] == "stop-loss")
+    second_tp = next(leg for leg in task["legs"] if leg["name"] == "take-profit-2")
+    assert status == "monitoring"
+    assert stop["quantity"] == pytest.approx(0.00335)
+    assert second_tp["status"] == "placed"  # a deliberate tranche is never cancelled
+    cancels = [call[1] for call in exchange.calls[calls_before:] if call[0] == "cancel"]
+    assert first_tp["order_id"] not in cancels
+    assert second_tp["order_id"] not in cancels
+
+
+def test_cancel_failure_after_replacement_keeps_old_id_for_later_cleanup():
+    manager, bridge, exchange, task_id = _bracket()
+    old_stop_id = job_store.load_bracket_recovery(task_id)["legs"][0]["order_id"]
+    exchange.cancel_error = ccxt.NetworkError("cancel response unavailable")
+
+    assert manager.replace_leg(
+        task_id, "stop-loss", trigger_price=49_000, quantity=0.005,
+        allow_mutation=True,
+    ) == "replacement_cleanup_pending"
+    task = job_store.load_bracket_recovery(task_id)
+    assert old_stop_id in task["legs"][0]["retired_ids"]
+    assert task["legs"][0]["order_id"] != old_stop_id
+
+    exchange.cancel_error = None
+    assert BracketManager(bridge).reconcile(
+        task_id, repair_missing=False, allow_sibling_cancel=True,
+    ) == "monitoring"
+    task = job_store.load_bracket_recovery(task_id)
+    assert task["legs"][0]["retired_ids"] == []
+    assert [call[1] for call in exchange.calls if call[0] == "cancel"].count(old_stop_id) == 2
 
 
 @pytest.mark.parametrize("response", [{"id": "exit"}, {"id": "exit", "status": "open"}, None])

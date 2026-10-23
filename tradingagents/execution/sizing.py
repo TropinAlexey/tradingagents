@@ -62,6 +62,7 @@ class PlannedOrder(BaseModel):
     reason: str | None = None
     market: Literal["spot", "derivatives"] = "spot"
     leverage: float = 1.0
+    margin_mode: Literal["isolated", "cross"] | None = None
     stop_loss: float | None = None
     take_profit: float | None = None
 

@@ -69,7 +69,7 @@ def _matches(item: dict, task: dict, leg: dict) -> bool:
     item_id = _order_id(item)
     if not item_id:
         return False
-    if leg.get("order_id"):
+    if leg.get("order_id") and leg.get("replacement_price") is None:
         return item_id == str(leg["order_id"])
     info = _info(item)
     if item.get("symbol") and item["symbol"] != task["symbol"]:
@@ -86,10 +86,11 @@ def _matches(item: dict, task: dict, leg: dict) -> bool:
     actual_type = str(info.get("orderType") or info.get("origType") or item.get("type") or "").upper()
     if expected_type != actual_type:
         return False
-    quantity = info.get("quantity", item.get("amount"))
+    expected_quantity = leg.get("replacement_quantity", leg.get("quantity", task["quantity"]))
+    actual_quantity = info.get("quantity", item.get("amount"))
     trigger = info.get("triggerPrice") or info.get("stopPrice") or item.get("triggerPrice")
-    price = leg["params"].get("stopLossPrice", leg["params"].get("takeProfitPrice"))
-    return _same_number(task["quantity"], quantity) and _same_number(price, trigger)
+    price = leg.get("replacement_price", leg["params"].get("stopLossPrice", leg["params"].get("takeProfitPrice")))
+    return _same_number(expected_quantity, actual_quantity) and _same_number(price, trigger)
 
 
 def _cancel_confirmed(response: Any, order_id: str) -> bool:
@@ -99,6 +100,17 @@ def _cancel_confirmed(response: Any, order_id: str) -> bool:
         return True
     info = _info(response)
     return str(info.get("code")) == "200" and info.get("msg") == "success"
+
+
+def conditional_params(exchange_id: str, params: dict) -> dict:
+    """Trigger on the venue's mark price so policy and venue agree."""
+    if exchange_id == "binance":
+        return {**params, "workingType": "MARK_PRICE"}
+    return params
+
+
+def _is_ladder(task: dict) -> bool:
+    return sum(1 for leg in task["legs"] if leg["name"].startswith("take-profit")) > 1
 
 
 class BracketManager:
@@ -111,6 +123,9 @@ class BracketManager:
     def _trigger_params(self) -> dict:
         return {"trigger": True} if self.bridge.exchange_id == "binance" else {}
 
+    def _conditional_params(self, params: dict) -> dict:
+        return conditional_params(self.bridge.exchange_id, params)
+
     def _save(self, task: dict, status: str, error: str | None = None) -> str:
         ids = [str(leg["order_id"]) for leg in task["legs"] if leg.get("order_id")]
         job_store.update_bracket_recovery(
@@ -121,7 +136,6 @@ class BracketManager:
         return status
 
     def place(self, order: PlannedOrder, confirm: bool, entry_order_id: str | None) -> None:
-        close_side = "sell" if order.side == "buy" else "buy"
         legs = [
             {"name": name, "params": {param: value}, "status": "pending", "order_id": None}
             for name, param, value in (
@@ -131,6 +145,42 @@ class BracketManager:
         ]
         if not legs:
             return
+        self._place_legs(order, legs, confirm, entry_order_id)
+
+    def place_ladder(
+        self,
+        order: PlannedOrder,
+        levels: list[tuple[float, float]],
+        confirm: bool,
+        entry_order_id: str | None,
+    ) -> None:
+        """Place one full-size stop plus deliberate profit tranches.
+
+        ``levels`` are ``(price, quantity)`` pairs ordered by distance; the
+        quantities must leave a runner that the trailing stop manages.
+        """
+        if order.stop_loss is None or not levels:
+            return
+        legs = [{"name": "stop-loss", "params": {"stopLossPrice": order.stop_loss},
+                 "status": "pending", "order_id": None}]
+        for index, (price, quantity) in enumerate(levels, start=1):
+            legs.append({
+                "name": f"take-profit-{index}",
+                "params": {"takeProfitPrice": price},
+                "status": "pending",
+                "order_id": None,
+                "quantity": quantity,
+            })
+        self._place_legs(order, legs, confirm, entry_order_id)
+
+    def _place_legs(
+        self,
+        order: PlannedOrder,
+        legs: list[dict],
+        confirm: bool,
+        entry_order_id: str | None,
+    ) -> None:
+        close_side = "sell" if order.side == "buy" else "buy"
         task_id = f"bracket:{order.ccxt_symbol}:{entry_order_id or 'unknown'}"
         with _TASK_LOCK:
             job_store.create_bracket_recovery(
@@ -139,14 +189,23 @@ class BracketManager:
                 now=datetime.now(timezone.utc).isoformat(), venue_key=_venue_key(self.bridge),
             )
             task = job_store.load_bracket_recovery(task_id)
+            position_key = f"{order.ccxt_symbol}:{order.side}:{entry_order_id or 'unknown'}"
+            position_state = job_store.load_position_state(position_key)
+            if position_state is not None and position_state.get("bracket_task_id") != task_id:
+                position_state["bracket_task_id"] = task_id
+                position_state["venue_key"] = _venue_key(self.bridge)
+                job_store.save_position_state(
+                    position_key, position_state["revision"], position_state,
+                )
             exchange = self.bridge.client()
             try:
                 for leg in task["legs"]:
                     if leg["status"] != "pending":
                         continue
+                    quantity = float(leg.get("quantity", task["quantity"]))
                     response = exchange.create_order(
-                        task["symbol"], "market", close_side, task["quantity"],
-                        None, {**leg["params"], "reduceOnly": True},
+                        task["symbol"], "market", close_side, quantity,
+                        None, self._conditional_params({**leg["params"], "reduceOnly": True}),
                     )
                     leg_id = _order_id(response)
                     if not leg_id:
@@ -209,14 +268,189 @@ class BracketManager:
                 task["status"] = "pending"
             filled = [leg for leg in task["legs"] if leg["status"] == "filled"]
             if filled:
+                if _is_ladder(task) and filled[0]["name"] != "stop-loss":
+                    return self._settle_ladder(task, filled[0], allow_sibling_cancel)
                 return self._cleanup(exchange, task, filled[0], allow_sibling_cancel)
             if all(leg["status"] == "cancelled" for leg in task["legs"]):
                 return self._save(task, "cancelled")
             if any(leg["status"] == "cancelled" for leg in task["legs"]):
                 return self._save(task, "monitoring", "conditional leg canceled without a confirmed fill")
+            cleanup_errors = self._cleanup_retired(exchange, task, allow_sibling_cancel)
+            if cleanup_errors:
+                status = "replacement_cleanup_pending" if any(
+                    leg.get("retired_ids") for leg in task["legs"]
+                ) else "monitoring"
+                return self._save(task, status, "; ".join(cleanup_errors))
+            if task["status"] == "replacement_cleanup_pending":
+                task["status"] = "monitoring"
             if repair_missing and any(leg["status"] == "pending" for leg in task["legs"]):
                 return self._repair(exchange, task)
             return self._save(task, task["status"] if task["status"] == "pending" else "monitoring")
+
+    def replace_leg(
+        self,
+        task_id: str,
+        leg_name: str,
+        *,
+        trigger_price: float,
+        quantity: float,
+        allow_mutation: bool,
+        min_stop_move: float = 0.0,
+    ) -> str:
+        """Place a replacement conditional leg before retiring its predecessor."""
+        if not math.isfinite(trigger_price) or trigger_price <= 0:
+            raise ValueError("replacement trigger must be finite and positive")
+        if not math.isfinite(quantity) or quantity <= 0:
+            raise ValueError("replacement quantity must be finite and positive")
+        if not math.isfinite(min_stop_move) or min_stop_move < 0:
+            raise ValueError("minimum stop movement must be finite and non-negative")
+        if not allow_mutation:
+            return "mutation_gated"
+        with _TASK_LOCK:
+            task = job_store.load_bracket_recovery(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            if task.get("venue_key") and task["venue_key"] != _venue_key(self.bridge):
+                self._save(task, task["status"], "configured venue/profile does not match the venue that placed this bracket")
+                return "venue_mismatch"
+            leg = next((item for item in task["legs"] if item["name"] == leg_name), None)
+            if leg is None:
+                raise ValueError(f"unknown bracket leg {leg_name!r}")
+            param = "stopLossPrice" if leg_name == "stop-loss" else "takeProfitPrice"
+            old_id = leg.get("order_id")
+            old_price = leg["params"].get(param)
+            exchange = self.bridge.client()
+            if old_id:
+                try:
+                    current = exchange.fetch_order(old_id, task["symbol"], params=self._trigger_params)
+                    current_state = _state(current)
+                except Exception:
+                    return "leg_state_unknown"
+                info = _info(current)
+                raw_status = str(info.get("algoStatus") or current.get("status") or "").upper()
+                if current_state == "filled" or raw_status in {"TRIGGERING", "TRIGGERED"}:
+                    return "leg_triggering"
+                if current_state not in {"placed", "cancelled"}:
+                    return "leg_state_unknown"
+                if current_state == "cancelled":
+                    return "leg_cancelled"
+            if old_price is not None:
+                improvement = trigger_price - float(old_price) if task["close_side"] == "sell" else float(old_price) - trigger_price
+                if improvement < 0:
+                    return "non_monotonic_replacement"
+                if leg_name == "stop-loss" and 0 < improvement < min_stop_move:
+                    return "below_minimum_stop_move"
+            if leg.get("replacement_price") is not None:
+                return self.reconcile(
+                    task_id, repair_missing=False, allow_sibling_cancel=True,
+                )
+            if leg["params"].get(param) == trigger_price and leg.get("quantity", task["quantity"]) == quantity:
+                return "unchanged"
+            leg.update(
+                status="uncertain", replacement_price=float(trigger_price),
+                replacement_quantity=float(quantity), price_key=param,
+            )
+            self._save(task, task["status"])
+            try:
+                response = exchange.create_order(
+                    task["symbol"], "market", task["close_side"], quantity,
+                    None, self._conditional_params({param: trigger_price, "reduceOnly": True}),
+                )
+                new_id = _order_id(response)
+                if not new_id:
+                    raise RuntimeError(f"{leg_name} replacement returned no id")
+            except ccxt.NetworkError as exc:
+                self._save(task, "monitoring", f"replacement submission uncertain: {exc!r}")
+                return "submission_uncertain"
+            except Exception as exc:
+                leg.pop("replacement_price", None)
+                leg.pop("replacement_quantity", None)
+                leg.pop("price_key", None)
+                leg["status"] = "placed"
+                self._save(task, "monitoring", f"replacement failed; existing leg retained: {exc!r}")
+                return "replacement_failed"
+            leg["retired_ids"] = list(dict.fromkeys([*leg.get("retired_ids", []), old_id])) if old_id else list(leg.get("retired_ids", []))
+            leg.update(
+                order_id=new_id, status="placed", params={param: float(trigger_price)},
+                quantity=float(quantity),
+            )
+            leg.pop("replacement_price", None)
+            leg.pop("replacement_quantity", None)
+            leg.pop("price_key", None)
+            task["status"] = "monitoring"
+            self._save(task, "monitoring")
+            errors = self._cleanup_retired(exchange, task, True)
+            if errors:
+                return self._save(task, "replacement_cleanup_pending", "; ".join(errors))
+            return "replaced"
+
+    def cancel_all(self, task_id: str, *, allow_mutation: bool) -> str:
+        """Cancel every current and retired leg after the venue reports a flat position."""
+        if not allow_mutation:
+            return "mutation_gated"
+        with _TASK_LOCK:
+            task = job_store.load_bracket_recovery(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            if task.get("venue_key") and task["venue_key"] != _venue_key(self.bridge):
+                self._save(task, task["status"], "configured venue/profile does not match the venue that placed this bracket")
+                return "venue_mismatch"
+            exchange = self.bridge.client()
+            errors = []
+            try:
+                existing = exchange.fetch_open_orders(task["symbol"], params=self._trigger_params)
+                if not isinstance(existing, list):
+                    raise ValueError("conditional order list is invalid")
+            except Exception as exc:
+                return self._save(task, "position_cleanup_pending", f"conditional order inspection failed: {exc!r}")
+            observed = {_order_id(item): item for item in existing if isinstance(item, dict) and _order_id(item)}
+            for leg in task["legs"]:
+                ids = list(dict.fromkeys(
+                    ([leg["order_id"]] if leg.get("order_id") else []) + leg.get("retired_ids", [])
+                ))
+                for order_id in ids:
+                    item = observed.get(order_id)
+                    try:
+                        if item is None:
+                            item = exchange.fetch_order(order_id, task["symbol"], params=self._trigger_params)
+                        state = _state(item) if isinstance(item, dict) else None
+                        if state == "cancelled" or state == "filled":
+                            continue
+                        if state != "placed":
+                            raise ValueError(f"unconfirmed status for conditional order {order_id}")
+                        response = exchange.cancel_order(
+                            order_id, task["symbol"], params=self._trigger_params,
+                        )
+                        if not _cancel_confirmed(response, str(order_id)):
+                            raise ValueError("conditional cancel returned unconfirmed status")
+                    except Exception as exc:
+                        errors.append(f"cancel {order_id}: {exc!r}")
+                if not errors:
+                    leg["status"] = "cancelled"
+                    leg["retired_ids"] = []
+            if errors:
+                return self._save(task, "position_cleanup_pending", "; ".join(errors))
+            return self._save(task, "completed")
+
+    def _cleanup_retired(self, exchange: Any, task: dict, allow_cancel: bool) -> list[str]:
+        errors = []
+        for leg in task["legs"]:
+            pending = list(leg.get("retired_ids", []))
+            for order_id in pending:
+                if not allow_cancel:
+                    errors.append(f"retired conditional cancellation gated off: {order_id}")
+                    continue
+                try:
+                    response = exchange.cancel_order(
+                        order_id, task["symbol"], params=self._trigger_params,
+                    )
+                    if not _cancel_confirmed(response, str(order_id)):
+                        raise ValueError("conditional cancel returned unconfirmed status")
+                    leg["retired_ids"].remove(order_id)
+                    self._save(task, "monitoring")
+                except Exception as exc:
+                    errors.append(f"cancel retired {order_id}: {exc!r}")
+        return errors
 
     def _inspect(self, exchange: Any, task: dict, existing: list) -> list[str]:
         observed = {_order_id(item): item for item in existing if isinstance(item, dict) and _order_id(item)}
@@ -225,7 +459,29 @@ class BracketManager:
             if leg["status"] in {"filled", "cancelled"}:
                 continue
             if leg["status"] == "uncertain":
-                if not leg.get("order_id"):
+                replacement_price = leg.get("replacement_price")
+                if replacement_price is not None and not leg.get("replacement_order_id"):
+                    candidates = [
+                        item for item in existing
+                        if isinstance(item, dict) and _matches(item, task, leg)
+                    ]
+                    if len(candidates) != 1:
+                        errors.append(f"uncertain replacement for {leg['name']}")
+                        continue
+                    replacement_id = _order_id(candidates[0])
+                    leg["replacement_order_id"] = replacement_id
+                    leg["retired_ids"] = list(dict.fromkeys(
+                        [*leg.get("retired_ids", []), leg["order_id"]]
+                    ))
+                    leg["order_id"] = replacement_id
+                    leg["params"] = {leg["price_key"]: replacement_price}
+                    leg["quantity"] = leg["replacement_quantity"]
+                    leg.pop("replacement_price", None)
+                    leg.pop("replacement_quantity", None)
+                    leg.pop("replacement_order_id", None)
+                    leg.pop("price_key", None)
+                    leg["status"] = "placed"
+                elif not leg.get("order_id"):
                     candidates = [item for item in existing if isinstance(item, dict) and _matches(item, task, leg)]
                     if len(candidates) != 1:
                         errors.append(f"uncertain {leg['name']} conditional submission")
@@ -254,6 +510,44 @@ class BracketManager:
             except Exception as exc:
                 errors.append(f"{order_id}: {exc!r}")
         return errors
+
+    def _settle_ladder(self, task: dict, winner: dict, allow_cancel: bool) -> str:
+        """One tranche filled: keep the rest of the ladder and resize the stop.
+
+        Cancelling the siblings here would throw away a deliberate scale-out
+        plan, so only the stop is resized to the remaining contracts.
+        """
+        self._save(task, "monitoring")
+        remaining = self._remaining_contracts(task)
+        if remaining <= 0:
+            return self._save(task, "completed")
+        stop = next((leg for leg in task["legs"] if leg["name"] == "stop-loss"), None)
+        if stop is None:
+            return self._save(task, "monitoring", "ladder has no stop to resize")
+        price = stop["params"].get("stopLossPrice")
+        current = float(stop.get("quantity", task["quantity"]))
+        if not _same_number(current, remaining):
+            status = self.replace_leg(
+                task["task_id"], "stop-loss", trigger_price=float(price),
+                quantity=remaining, allow_mutation=allow_cancel,
+            )
+            if status not in {"replaced", "unchanged"}:
+                return self._save(task, "monitoring", f"ladder stop resize pending: {status}")
+        # replace_leg already persisted the new stop; saving this stale copy
+        # would write the old order id and quantity back over it.
+        return "monitoring"
+
+    def _remaining_contracts(self, task: dict) -> float:
+        try:
+            from tradingagents.execution.futures_account import read_futures_positions
+
+            side = "long" if task["close_side"] == "sell" else "short"
+            for position in read_futures_positions(self.bridge):
+                if position.symbol == task["symbol"] and position.side == side:
+                    return abs(float(position.contracts or 0.0))
+        except Exception:
+            return float(task["quantity"])
+        return 0.0
 
     def _cleanup(self, exchange: Any, task: dict, winner: dict, allow_cancel: bool) -> str:
         errors = []
@@ -287,7 +581,7 @@ class BracketManager:
                     continue
                 response = exchange.create_order(
                     task["symbol"], "market", task["close_side"], task["quantity"],
-                    None, {**leg["params"], "reduceOnly": True},
+                    None, self._conditional_params({**leg["params"], "reduceOnly": True}),
                 )
                 leg_id = _order_id(response)
                 if not leg_id:

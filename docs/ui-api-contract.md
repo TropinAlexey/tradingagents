@@ -133,7 +133,8 @@ Response 200:
 ```
 
 - `settings[]` phản ánh `_ENV_OVERRIDES`; `exec_base_url` xuất hiện read-only dù được đọc từ `TRADINGAGENTS_EXEC_BASE_URL`. PUT key này → `403 forbidden_key`. `exec_sandbox` chỉ dùng cho sandbox của sàn khác, không chọn Binance venue.
-- `settings[]` có các row editable từ `_ENV_OVERRIDES` và các row read-only bổ sung (`exec_base_url` cùng các path); `type` suy từ kiểu default trong `DEFAULT_CONFIG`.
+- `settings[]` bao gồm các numeric policy `risk_derivatives_*`: `profit_protection_enabled` (default true, chỉ quản lý state do bot mở), `break_even_r`=1, `lock_profit_r`=2, `trail_start_r`=3, `trail_distance_r`=1, `target_extension_r`=1, `min_stop_move_r`=0.1, `mark_max_age_seconds`=120. Scale-out: `scale_out_enabled`=false, `scale_out_first_r`=1, `scale_out_first_fraction`=0.33, `scale_out_second_r`=2, `scale_out_second_fraction`=0.33. Chúng không thuộc `gates_readonly` và không thể mở `exec_live`/`exec_derivatives`; hai cặp gate env/config vẫn độc lập.
+- Profit-protection thresholds là bội số của R (entry thực tế tới initial stop). Backend yêu cầu các R dương, `break_even < lock_profit < trail_start`; giá trị sai không gọi venue và trả state `invalid_policy_config` ở monitor. `min_stop_move_r` chặn thay SL khi chênh lệch quá nhỏ; `mark_max_age_seconds` khiến mark cũ trả `mark_stale` và không mutate. Monitor cũng từ chối khi account không phải One-way (`hedge_mode_unsupported`) hoặc không đọc được position mode (`position_mode_unavailable`).
 - Với Binance, `exec_base_url` chỉ chấp nhận HTTPS API host Demo hoặc production được allowlist. URL được chọn quyết định credential pair: Demo dùng `BINANCE_DEMO_API_KEY`/`BINANCE_DEMO_SECRET`; production dùng `BINANCE_API_KEY`/`BINANCE_SECRET`. Demo là default. Đổi profile cần sửa URL + đúng pair trong `.env` rồi restart; API GET chỉ expose URL và status/mask, PUT không đổi được URL.
 - `effective_exec_mode` độc lập với venue URL: `live` chỉ khi `exec_live is True` **và** `TRADINGAGENTS_EXEC_LIVE=true`; chọn Demo không tự mở gate.
 - Paths read-only (`results_dir`, `data_cache_dir`, `memory_log_path`, `exec_log_path`) và `exec_base_url` trả trong `settings[]` với `editable: false`.
@@ -156,7 +157,7 @@ Request:
 
 Xử lý:
 
-1. Validate từng key: phải thuộc 30 keys `_ENV_OVERRIDES`; coerce theo kiểu default như `_coerce` (`default_config.py:60-80`) — sai kiểu → `422 coercion_error` kèm `details: {"env_var": "...", "message": "expected a boolean (true/1/yes/on/false/0/no/off), got 'treu'"}`.
+1. Validate từng key: phải thuộc `_ENV_OVERRIDES` (trừ `exec_base_url` read-only); coerce theo kiểu default như `_coerce` (`default_config.py:60-80`) — sai kiểu → `422 coercion_error` kèm `details: {"env_var": "...", "message": "expected a boolean (true/1/yes/on/false/0/no/off), got 'treu'"}`.
 2. Áp in-memory: `set_config({key: value})` (`dataflows/config.py`) — có hiệu lực với run mới tạo sau đó; run đang chạy không thấy (bridge chụp config lúc dựng — `bridge.py:110-121`).
 3. Persist vào `.env` (upsert dòng `TRADINGAGENTS_…`, giữ nguyên các dòng khác và comment). Ghi `encoding="utf-8"`.
 4. Nếu key là `exec_sandbox` → cảnh báo không cần (an toàn); nếu key là `risk_*` → nhớ rằng giá trị mới chỉ dùng cho guard dựng sau (`bridge.py:147-156`).
@@ -167,13 +168,34 @@ Errors: 403 `forbidden_key` (key read-only hoặc key lạ), 422, 500 (không gh
 
 Trạng thái: loading · empty (n/a) · error · stale (n/a — action).
 
+### Operator overrides — `GET /api/operator-config`, `PUT /api/operator-config`, `DELETE /api/operator-config/{key}`
+
+Nguồn: `server/operator_config.py`. Đây là các key mà `PUT /api/settings` **cố ý từ chối**: nửa cấu hình của ba cổng thực thi (`exec_live`, `exec_auto_confirm`, `exec_derivatives`) và ba trần rủi ro vận hành (`risk_max_derivatives_leverage`, `risk_max_derivatives_exposure_pct`, `risk_derivatives_scale_out_enabled`).
+
+Lưu trữ: **PostgreSQL** — bảng `control_operator_settings` (`server/migrations/0003_operator_settings.sql`), đọc lại lúc startup bởi `server/main.py:_apply_operator_config`. Không còn file `operator_config.json`; `server/data/` đã rỗng và không được mount vào container.
+
+GET trả `settings[]` với `key, type, group, label, hint, gate, value, default, override, stored_value, updated_at, updated_by`, cộng `gates`, `effective_exec_mode`, `allowlist`.
+
+PUT body: `{"settings": {key: value}, "confirm": bool, "reason": str, "actor": str}`.
+
+1. Key ngoài allowlist → `403 forbidden_key` (kèm `details.rejected` và `details.allowlist`).
+2. Sai kiểu → `422 coercion_error`.
+3. Có key thuộc nhóm cổng → bắt buộc `confirm: true` (`412 gate_confirmation_required`) **và** `reason` không rỗng (`422 reason_required`).
+4. Ghi PostgreSQL → `set_config` in-memory → audit `operator_config_updated` với `changes: {key: {from, to}}`, `gate_changes`, `reason`, `actor`.
+
+DELETE `/{key}` xoá override để quay về default engine (`DEFAULT_CONFIG`), audit `operator_config_reset`. Key không thuộc allowlist → 403; không có override → 404.
+
+**Cổng vẫn là hai khoá.** Bảng này chỉ giữ nửa cấu hình; nửa môi trường (`TRADINGAGENTS_EXEC_LIVE` / `_AUTO_CONFIRM` / `_DERIVATIVES`) vẫn được đọc fail-closed lúc gửi lệnh trong `bridge.py`.
+
+Trạng thái: loading · empty (n/a) · error · stale (n/a — action).
+
 ---
 
 ## 2. Watchlist — `GET /api/watchlist`, `POST /api/watchlist`, `DELETE /api/watchlist/{symbol}`
 
 Nguồn: `exec_watchlist` default `["BTC-USD","ETH-USD"]` (`default_config.py:233-234`); chuẩn hóa biên giới của daily runner (`daily.py:95-111`).
 
-Lưu trữ: engine đọc `exec_watchlist` từ config; vì key không env-overridable, API layer giữ file state riêng `~/.tradingagents/webui/watchlist.json` và sync vào `DEFAULT_CONFIG["exec_watchlist"]` khi khởi động server và sau mỗi ghi. Endpoint `run_daily(watchlist=…)` nhận watchlist tường minh (`daily.py:114-128`) nên truyền trực tiếp, không phụ thuộc file.
+Lưu trữ: engine đọc `exec_watchlist` từ config; vì key không env-overridable, API layer giữ state trong PostgreSQL (bảng `control_watchlist`, `server/control_store.py`) và sync vào `DEFAULT_CONFIG["exec_watchlist"]` khi khởi động server và sau mỗi ghi. Endpoint `run_daily(watchlist=…)` nhận watchlist tường minh (`daily.py:114-128`) nên truyền trực tiếp, không phụ thuộc file.
 
 ### GET /api/watchlist
 
@@ -1170,8 +1192,14 @@ Khi worker đang queued/running, hook poll mỗi 5 giây; khi idle poll mỗi 15
 
 Hai nửa (1)+(2) hiển thị trong `gates()` là `exec_derivatives_config`/`exec_derivatives_env` — **chỉ quan sát**, không tham gia `all_open` (`autoloop.py:116-118`); enable autoloop vẫn chỉ cần 2 nửa auto-confirm.
 
-**Đòn bẩy:** cycle xin `min(risk_max_derivatives_leverage, MAX_AUTO_LEVERAGE = 3.0)`; thiếu config entry → 1× (`_auto_leverage` — `autoloop.py:62, 347-353`). RiskGuard với `risk_max_derivatives_leverage` vẫn là gate có thẩm quyền (từ chối được dưới trần hệ thống); executor pin leverage trên venue cho mỗi lệnh (`derivatives.py:321-324`).
+**Đòn bẩy, margin mode và ngân sách rủi ro do agent quyết định.** Trader đề xuất `FuturesExecutionProposal` (margin mode, leverage, `risk_fraction`, `margin_fraction`, entry/SL/TP, rationale); Portfolio Manager chốt lại sau tranh luận risk và trả về `futures_execution_proposal` trong state cuối. Autoloop chỉ **kiểm tra** đề xuất: thiếu proposal → `agent_proposal_missing` (không vào lệnh), vượt trần → từ chối chứ không tự hạ xuống, vì một lệnh bị resize không còn là quyết định của agent. Trần hiện hành: `MAX_AUTO_LEVERAGE = 3.0`, `risk_derivatives_max_risk_fraction` (mặc định 0.02), `risk_derivatives_max_margin_fraction` (mặc định 0.5). `risk_max_derivatives_leverage` vẫn là gate có thẩm quyền của RiskGuard và có thể từ chối dưới trần hệ thống. Executor gọi `set_margin_mode` trước `set_leverage`, rồi mới gửi entry, nên margin mode không còn phụ thuộc preset của sàn.
 
-**Position state (rev 8):** after a live derivatives entry is acknowledged and bracketed, the executor persists an initial `position_states` row keyed by unified symbol, side, and entry order id. It records planned entry, sent quantity, stop, target, and order provenance. `PositionManager` uses the DB CAS revision independently of the venue revision and deletes its snapshot when its adapter reconciles the venue flat. This is durable policy state, not a background polling service: the current autoloop does not instantiate a venue `PositionAdapter` for automatic trailing/partial management; exchange-side bracket and bracket recovery remain the active automatic protection path.
+**Nguồn vốn sizing là ví Futures, không phải spot.** Cycle đọc `read_futures_account()` và dựng `PortfolioContext` từ `equity` (fallback `available_balance`) của tài khoản derivatives; `ExchangeBridge.sync_portfolio()` là snapshot spot nên không dùng cho sizing futures. Chính dữ liệu đó (equity, available margin, vị thế mở, nến đóng 1h/4h, bracket ATR, các trần hard) được render thành `execution_context` gửi cho agent; digest của context nằm trong checkpoint signature nên resume không tái dùng quyết định của một snapshot khác.
+
+**Position state + profit protection:** sau live derivatives entry, executor ưu tiên `filled`/`average` từ response; nếu thiếu một trường, đọc vị thế futures exact symbol/side rồi dùng `contracts`, entry và mark của venue. State lưu `initial_stop`, `current_target`, venue + `bracket_task_id` và thời điểm quan sát. Background monitor poll 30 giây chỉ khi policy cùng cả derivatives/live config+env gates bật. Chính sách tính R từ entry thực tế tới initial stop; break-even/lock/trailing chỉ nâng stop theo hướng giảm rủi ro và target chỉ được đẩy xa hơn khi mark vượt target nhưng position vẫn mở.
+
+Bracket replacement đặt conditional leg mới trước, persist order ID/trigger rồi mới cancel leg cũ; timeout được reconcile theo strict symbol/side/type/reduceOnly/quantity/trigger. Cancel chưa xác nhận giữ retired ID trong SQLite để retry. Monitor lease atomic theo position key ngăn nhiều process cùng mutate; nhiều entry state cùng một Binance net position trả `ambiguous_net_position` và không tự chia size. Khi venue báo flat, chỉ xóa state sau khi các leg hiện hành/retired được xác nhận canceled hoặc filled.
+
+Policy không đảm bảo giá khớp/lợi nhuận trong gap, slippage, liquidation hay outage. Binance Futures mutation hiện là venue được hỗ trợ; venue khác fail-closed. Không tự đổi One-way/Hedge mode; `reduceOnly` rejection được ghi nhận và không đổi state policy.
 
 **Venue Binance:** mặc định chọn Demo qua `TRADINGAGENTS_EXEC_BASE_URL=https://demo-api.binance.com`; ccxt tự route futures tới `demo-fapi.binance.com`. Chuyển production bằng cách thay URL thành `https://api.binance.com`, dùng `BINANCE_API_KEY`/`BINANCE_SECRET`, rồi restart backend. Bridge chỉ nhận đúng hai profile HTTPS allowlist này và chọn key pair tương ứng. Các gate `exec_live` + `TRADINGAGENTS_EXEC_LIVE` vẫn độc lập; Demo order vẫn là live execution trên tài khoản Demo, không phải dry-run.

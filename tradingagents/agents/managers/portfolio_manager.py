@@ -29,6 +29,8 @@ def create_portfolio_manager(llm):
     def portfolio_manager_node(state) -> dict:
         instrument_context = get_instrument_context_from_state(state)
         portfolio_context = get_portfolio_context_from_state(state)
+        execution_context = (state.get("execution_context") or "").strip()
+        futures_context = state.get("asset_type") == "crypto" and bool(execution_context)
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
@@ -40,6 +42,12 @@ def create_portfolio_manager(llm):
             f"- Lessons from prior decisions and outcomes:\n{past_context}\n"
             if past_context
             else ""
+        )
+        # Backslash-in-f-string-expression is Python 3.12+ syntax; the repo
+        # targets 3.10, so the block is built as a variable.
+        futures_context_block = (
+            f"**Current Futures Account and Market Context:**\n{execution_context}"
+            if futures_context else ""
         )
 
         prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
@@ -64,9 +72,13 @@ def create_portfolio_manager(llm):
 **Risk Analysts Debate History:**
 {history}
 
+{futures_context_block}
+
 ---
 
 Ground every conclusion in specific evidence from the analysts. The risk debate always contains conflicting stances; deciding which is stronger is the job, so conflict alone is not a reason to Hold. Commit to the stronger case, sized by how decisively it wins. Choose Hold only when the evidence is still balanced after that weighing, or too thin to support a call; do not force a direction to appear decisive. Weigh the analysts on their merits, independent of speaking order.
+
+For a crypto futures decision, review the Trader's execution proposal against the full risk debate and the current account context. The Trader's terms are a proposal, not an instruction: you own the final choice of margin mode, leverage, risk_fraction, margin_fraction, entry, stop-loss, and take-profit. Choose isolated or cross explicitly. Prefer isolated unless the debate identifies a concrete account-level reason for cross margin. Do not maximize leverage; select it based on volatility, stop distance, the instrument's leverage tier, available margin, and expected reward/risk. Keep the risk budget consistent with your conviction and the evidence, not with the maximum amount the venue permits. Return a complete FuturesExecutionProposal only when the final rating is tradeable and a protective bracket is supported; otherwise leave it null. Explain the evidence behind the final terms. The execution system will validate your choice against independent hard limits and will reject it rather than silently substituting different values.
 
 ## Output
 
@@ -78,12 +90,14 @@ Write these sections, in this order, starting with the rating on its own line:
 
 {NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
 
+        decision_holder = {}
         final_trade_decision = invoke_structured_or_freetext(
             structured_llm,
             llm,
             prompt,
             render_pm_decision,
             "Portfolio Manager",
+            on_result=lambda decision: decision_holder.update(decision=decision),
         )
 
         new_risk_debate_state = {
@@ -102,6 +116,13 @@ Write these sections, in this order, starting with the rating on its own line:
         return {
             "risk_debate_state": new_risk_debate_state,
             "final_trade_decision": final_trade_decision,
+            "futures_execution_proposal": (
+                decision_holder["decision"].futures_execution.model_dump()
+                if futures_context
+                and decision_holder.get("decision") is not None
+                and decision_holder["decision"].futures_execution is not None
+                else {}
+            ),
         }
 
     return portfolio_manager_node
