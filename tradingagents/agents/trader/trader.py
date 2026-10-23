@@ -113,6 +113,10 @@ def create_trader(llm):
             messages,
             render_trader_proposal,
             "Trader",
+            structured_retry_instruction=(
+                "Return the TraderProposal schema now. Do not answer with prose outside the "
+                "schema fields; if futures context exists, set futures_execution_intent explicitly."
+            ) if futures_context else None,
         )
 
         return {

@@ -78,3 +78,4 @@ class AgentState(MessagesState):
     execution_context: Annotated[str, "Current venue/account and market facts provided to execution decision agents"]
     futures_execution_proposal: Annotated[dict, "Final Portfolio Manager futures execution proposal, when one is supported"]
     futures_execution_intent: Annotated[str, "Final futures intent: enter, manage_existing, or abstain"]
+    futures_execution_status: Annotated[str, "Futures structured-output status for diagnostics"]

@@ -141,6 +141,11 @@ Write these sections, in this order, starting with the rating on its own line:
                 if futures_context and decision_holder.get("decision") is not None
                 else "structured_terms_unavailable" if futures_context and fallback_holder else "abstain"
             ),
+            "futures_execution_status": (
+                "structured" if futures_context and decision_holder.get("decision") is not None
+                else "fallback_report_only" if futures_context and fallback_holder
+                else "not_applicable"
+            ),
         }
 
     return portfolio_manager_node

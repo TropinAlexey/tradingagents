@@ -39,6 +39,7 @@ class Propagator:
             "execution_context": execution_context,
             "futures_execution_proposal": {},
             "futures_execution_intent": "abstain",
+            "futures_execution_status": "not_applicable",
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",
