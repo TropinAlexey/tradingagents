@@ -179,6 +179,8 @@ def test_portfolio_manager_emits_explicit_abstain_intent_without_terms():
     })
 
     assert result["futures_execution_proposal"] == proposal.model_dump()
+    assert result["futures_execution_intent"] == "enter"
+    assert result["futures_execution_status"] == "structured"
     assert "Futures equity: 1000 USDT" in str(structured.invoke.call_args.args[0])
 
 

@@ -531,14 +531,18 @@ def _agent_proposal(**overrides) -> dict:
 class _FakeGraph:
     """propagate() returns a fixed signal/state and records the calls it saw."""
 
-    def __init__(self, signal: str, proposal: dict | None = None):
+    def __init__(self, signal: str, proposal: dict | None = None, intent: str = "enter"):
         self._signal = signal
         self._proposal = _agent_proposal() if proposal is None else proposal
+        self._intent = intent
         self.calls: list[tuple[str, str, str]] = []
 
     def propagate(self, ticker: str, trade_date: str, asset_type: str | None = None):
         self.calls.append((ticker, trade_date, str(asset_type)))
-        state = {"futures_execution_proposal": self._proposal}
+        state = {
+            "futures_execution_proposal": self._proposal,
+            "futures_execution_intent": self._intent,
+        }
         return state, self._signal
 
 
@@ -887,6 +891,7 @@ def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
                 ticker="BTC-USD",
                 ccxt_symbol="BTC/USDT",
                 signal="Buy",
+                futures_execution_intent="enter",
                 side="buy",
                 quantity=0.01,
                 cost=500.0,
@@ -1307,11 +1312,13 @@ def test_futures_worker_wiring_claims_and_skips_duplicate(tmp_path, monkeypatch)
     result = autoloop_mod.DailyResult(ticker="BTC-USD")
     autoloop_mod._process_futures_candidate(
         Derivatives(), "BTC-USD", "Buy", {}, result, proposal=_agent_proposal(),
+        intent="enter",
     )
     assert result.reason == "awaiting approval"
     duplicate = autoloop_mod.DailyResult(ticker="BTC-USD")
     autoloop_mod._process_futures_candidate(
         Derivatives(), "BTC-USD", "Buy", {}, duplicate, proposal=_agent_proposal(),
+        intent="enter",
     )
     assert duplicate.reason == "duplicate futures signal skipped"
 
@@ -1337,6 +1344,41 @@ def test_futures_intent_abstain_is_recorded_without_planning(monkeypatch):
     assert result.reason == "agent_abstained"
 
 
+@pytest.mark.parametrize(
+    ("signal", "intent", "reason"),
+    [
+        ("Sell", None, "structured_terms_unavailable"),
+        ("Underweight", None, "structured_terms_unavailable"),
+        ("Sell", "manage_existing", "position_management_only"),
+        ("Underweight", "manage_existing", "position_management_only"),
+        ("Sell", "unexpected", "invalid_futures_intent: unexpected"),
+    ],
+)
+def test_bearish_rating_never_bypasses_missing_or_non_entry_intent(
+    monkeypatch, signal, intent, reason,
+):
+    result = autoloop_mod.DailyResult(ticker="BTC-USD")
+    context = _market_context()
+
+    class Derivatives(_NoopDerivatives):
+        def plan_order(self, *args, **kwargs):
+            pytest.fail("non-entry intent must never reach futures planning")
+
+    monkeypatch.setattr(
+        autoloop_mod,
+        "_record_futures_cycle_rejection",
+        lambda *args, **kwargs: None,
+    )
+    autoloop_mod._process_futures_candidate(
+        Derivatives(), "BTC-USD", signal, {}, result,
+        context=context, proposal=_agent_proposal(), intent=intent,
+    )
+
+    assert result.plan is None
+    assert result.executed is False
+    assert result.reason == reason
+
+
 def test_futures_entry_without_agent_proposal_is_refused():
     """The decision agents own the futures terms: without a proposal the cycle
     records the refusal instead of falling back to code-chosen leverage."""
@@ -1345,6 +1387,7 @@ def test_futures_entry_without_agent_proposal_is_refused():
     result = autoloop_mod.DailyResult(ticker="BTC-USD")
     autoloop_mod._process_futures_candidate(
         _NoopDerivatives(), "BTC-USD", "Buy", {}, result, context=_market_context(),
+        intent="enter",
     )
 
     assert result.plan is None and result.executed is False
@@ -1365,7 +1408,7 @@ def test_agent_proposal_is_the_source_of_leverage_and_budgets(monkeypatch):
             captured.update(kwargs)
             return PlannedOrder(
                 ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy",
-                market="derivatives", side="buy", quantity=1, cost=100,
+                market="derivatives", futures_execution_intent="enter", side="buy", quantity=1, cost=100,
                 estimated_price=100, stop_loss=90, take_profit=110,
             )
 
@@ -1379,6 +1422,7 @@ def test_agent_proposal_is_the_source_of_leverage_and_budgets(monkeypatch):
         Derivatives(), "BTC-USD", "Buy", {}, result, context=_market_context(),
         proposal=_agent_proposal(leverage=2, risk_fraction=0.004, margin_fraction=0.15,
                                  margin_mode="cross", stop_loss=90.0, take_profit=110.0),
+        intent="enter",
         portfolio=PortfolioContext(cash=1_000.0, currency="USDT"),
     )
 

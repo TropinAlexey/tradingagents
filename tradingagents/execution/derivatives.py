@@ -149,6 +149,7 @@ class DerivativesExecutor:
         risk_fraction: float | None = None,
         margin_fraction: float | None = None,
         margin_mode: str | None = None,
+        futures_execution_intent: str | None = None,
     ) -> PlannedOrder:
         """Size a derivatives plan; refuses (audited) unless gates (a)+(b) are open.
 
@@ -156,6 +157,12 @@ class DerivativesExecutor:
         Sell/Underweight size like Buy/Overweight instead of reading the
         book. ``cost`` is the margin; quantity covers notional*leverage.
         Without ``price`` the plan is a network read.
+
+        ``futures_execution_intent`` is the authorization for a NEW position:
+        a tradeable rating is only a market view, so planning refuses unless
+        the caller passes exactly ``"enter"`` (the Portfolio Manager's typed
+        decision). Underweight/Sell never authorize a short on their own.
+        ``Hold``/``REVIEW`` stay no-order plans and need no authorization.
 
         ``risk_fraction``/``margin_fraction``/``margin_mode`` are the decision
         agents' terms; ``None`` keeps the configured sizing defaults. The
@@ -165,9 +172,11 @@ class DerivativesExecutor:
         # The shell stays valid while the terms are still unvalidated: an
         # unrecognized margin_mode must become a refused plan (audited) rather
         # than a pydantic ValidationError escaping the planner.
+        authorized = "enter" if futures_execution_intent == "enter" else None
         shell = PlannedOrder(
             ticker=ticker, ccxt_symbol=offline_symbol, signal=signal,
             market="derivatives", leverage=leverage,
+            futures_execution_intent=authorized,
         )
         if self.config.get("exec_derivatives") is not True:
             raise self._refuse(
@@ -183,6 +192,14 @@ class DerivativesExecutor:
                 "nothing was planned",
                 phase="plan",
             )
+        if signal in (_BUY, _OVERWEIGHT, _SELL, _UNDERWEIGHT) and authorized is None:
+            raise self._refuse(
+                shell,
+                "futures entry requires futures_execution_intent='enter' "
+                f"(got {futures_execution_intent!r}): an investment rating alone "
+                "never authorizes a new futures position; nothing was planned",
+                phase="plan",
+            )
         ccxt_symbol = self.resolve_market(ticker)
         if price is None:
             price = self._bridge.fetch_price(ticker)
@@ -195,6 +212,7 @@ class DerivativesExecutor:
                 stop_loss=None, take_profit=None,
                 risk_fraction=risk_fraction, margin_fraction=margin_fraction,
                 margin_mode=margin_mode,
+                futures_execution_intent=authorized,
             )
             order.mode = mode
             self._bridge.audit_plan(order, action="no_order", reason=order.reason, phase="plan")
@@ -205,6 +223,7 @@ class DerivativesExecutor:
             stop_loss=stop_loss, take_profit=take_profit,
             risk_fraction=risk_fraction, margin_fraction=margin_fraction,
             margin_mode=margin_mode,
+            futures_execution_intent=authorized,
         )
         order.mode = mode
         decision = self.risk_guard.check(order, portfolio, self.config["exec_log_path"])
@@ -250,6 +269,21 @@ class DerivativesExecutor:
         if order.side is None or order.quantity is None:
             raise ValueError(
                 f"not an executable order: side={order.side!r}, quantity={order.quantity!r}"
+            )
+        if order.futures_execution_intent != "enter":
+            self._bridge.audit_plan(
+                order,
+                action="derivatives_denied",
+                reason=(
+                    "futures execution requires explicit futures_execution_intent='enter'; "
+                    "nothing was sent"
+                ),
+                confirmed=confirm,
+                phase="execute",
+            )
+            raise PermissionError(
+                "futures execution requires explicit futures_execution_intent='enter'; "
+                "nothing was sent"
             )
         try:
             validate_bracket(
@@ -338,6 +372,7 @@ class DerivativesExecutor:
         risk_fraction: float | None = None,
         margin_fraction: float | None = None,
         margin_mode: str | None = None,
+        futures_execution_intent: str | None = None,
     ) -> PlannedOrder:
         """Derivatives mapping of the 5-tier signal; always returns a plan."""
         book = portfolio if portfolio is not None else PortfolioContext()
@@ -351,6 +386,7 @@ class DerivativesExecutor:
                 ticker=ticker, ccxt_symbol=ccxt_symbol, signal=signal,
                 market="derivatives", leverage=leverage,
                 margin_mode=plan_margin_mode,
+                futures_execution_intent=futures_execution_intent,
                 needs_review=needs_review, reason=reason,
             )
 
@@ -411,6 +447,7 @@ class DerivativesExecutor:
             ticker=ticker, ccxt_symbol=ccxt_symbol, signal=signal,
             side=side, quantity=quantity, estimated_price=price, cost=cost,
             market="derivatives", leverage=leverage, margin_mode=plan_margin_mode,
+            futures_execution_intent=futures_execution_intent,
             stop_loss=stop_loss, take_profit=take_profit,
         )
 

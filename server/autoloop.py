@@ -668,7 +668,7 @@ def _process_candidate(
                 if isinstance(state, dict) else None
             )
             if intent is None:
-                intent = "enter" if isinstance(proposal, dict) and proposal else "structured_terms_unavailable"
+                intent = "structured_terms_unavailable"
             if intent != "enter":
                 result.reason = {
                     "abstain": "agent_abstained",
@@ -687,7 +687,7 @@ def _process_candidate(
                 _process_futures_candidate(
                     derivatives, ticker, signal, config, result,
                     context=futures_context, proposal=proposal,
-                    portfolio=futures_portfolio, brackets=brackets,
+                    portfolio=futures_portfolio, brackets=brackets, intent=intent,
                     deadline=deadline, cancelled=cancelled,
                     execution_lock=execution_lock, telemetry=telemetry,
                 )
@@ -1061,7 +1061,7 @@ def _process_futures_candidate(
     candle_1h = context["one_hour"]
     candle_4h = context["four_hour"]
     if intent is None:
-        intent = "enter"
+        intent = "structured_terms_unavailable"
     if intent != "enter":
         result.reason = {
             "abstain": "agent_abstained",
@@ -1166,6 +1166,7 @@ def _process_futures_candidate(
                 risk_fraction=terms["risk_fraction"],
                 margin_fraction=terms["margin_fraction"],
                 margin_mode=terms["margin_mode"],
+                futures_execution_intent=intent,
             )
         result.plan = plan
         if deadline is not None:
@@ -1245,8 +1246,12 @@ def _build_derivatives_executor(config: dict) -> Any:
 
 
 def _direction(signal: str) -> str:
-    """Bracket direction for a 5-tier signal: Sell/Underweight open shorts on
-    the derivatives path, so their bracket mirrors the long side."""
+    """Map an authorized entry rating to its futures bracket direction.
+
+    Sell/Underweight become short only after the separate PM intent gate has
+    explicitly authorized a fresh ``enter`` decision; the rating alone is not
+    a futures authorization.
+    """
     return "short" if signal in (_SELL, _UNDERWEIGHT) else "long"
 
 

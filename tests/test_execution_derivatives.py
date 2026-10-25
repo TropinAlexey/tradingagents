@@ -190,8 +190,14 @@ def live_env(**extra):
 
 
 def bracket_kwargs(signal="Buy"):
-    return {"stop_loss": 48_000.0, "take_profit": 55_000.0} if signal != "Sell" else {
-        "stop_loss": 52_000.0, "take_profit": 45_000.0,
+    return {
+        "stop_loss": 48_000.0,
+        "take_profit": 55_000.0,
+        "futures_execution_intent": "enter",
+    } if signal != "Sell" else {
+        "stop_loss": 52_000.0,
+        "take_profit": 45_000.0,
+        "futures_execution_intent": "enter",
     }
 
 
@@ -227,6 +233,7 @@ def test_every_default_path_is_refused(tmp_path, monkeypatch):
         ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy", side="buy",
         quantity=0.005, estimated_price=50_000.0, cost=250.0, market="derivatives",
         stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
     )
     with pytest.raises(PermissionError, match="confirm=True"):
         executor.execute_order(crafted, portfolio=PortfolioContext(cash=1_000.0))
@@ -273,6 +280,56 @@ def test_config_gate_env_var_is_not_a_config_override(monkeypatch):
     assert config["exec_derivatives"] is False
 
 
+def test_tradeable_rating_without_explicit_intent_is_refused_before_market_resolution(
+    tmp_path, monkeypatch,
+):
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=gates_config(risk_max_derivatives_exposure_pct=100.0),
+        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
+    )
+    monkeypatch.setattr(
+        executor,
+        "resolve_market",
+        lambda *_args, **_kwargs: pytest.fail("missing intent must refuse before market resolution"),
+    )
+
+    with pytest.raises(PermissionError, match="futures_execution_intent='enter'"):
+        executor.plan_order(
+            "BTC-USD", "Sell", PortfolioContext(cash=1_000.0), price=50_000.0,
+            stop_loss=52_000.0, take_profit=45_000.0,
+        )
+
+    event = read_audit(tmp_path)[-1]
+    assert event["action"] == "derivatives_denied"
+    assert "investment rating alone" in event["reason"]
+
+
+def test_crafted_derivatives_order_without_intent_is_refused_before_risk_or_send(
+    tmp_path, monkeypatch,
+):
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=gates_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange,
+        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
+    )
+    from tradingagents.execution.sizing import PlannedOrder
+
+    crafted = PlannedOrder(
+        ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Sell", side="sell",
+        quantity=0.005, estimated_price=50_000.0, cost=250.0, market="derivatives",
+        stop_loss=52_000.0, take_profit=45_000.0,
+    )
+
+    with pytest.raises(PermissionError, match="futures_execution_intent='enter'"):
+        executor.execute_order(crafted, confirm=True, portfolio=PortfolioContext(cash=1_000.0))
+
+    assert exchange.calls == []
+    assert read_audit(tmp_path)[-1]["action"] == "derivatives_denied"
+
+
 # --- plans once the gates are open -------------------------------------------
 
 
@@ -285,6 +342,7 @@ def test_gated_dry_plan_long(tmp_path, monkeypatch):
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
         stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
     )
     assert order.side == "buy"
     assert order.market == "derivatives"
@@ -294,17 +352,22 @@ def test_gated_dry_plan_long(tmp_path, monkeypatch):
     assert order.ccxt_symbol == "BTC/USDT:USDT"
 
 
-def test_gated_plan_sell_opens_a_short_without_holdings(tmp_path, monkeypatch):
+@pytest.mark.parametrize("signal", ["Sell", "Underweight"])
+def test_gated_plan_bearish_rating_opens_a_short_only_with_explicit_entry_intent(
+    tmp_path, monkeypatch, signal,
+):
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
         env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     order = executor.plan_order(
-        "BTC-USD", "Sell", PortfolioContext(cash=1_000.0), price=50_000.0,
+        "BTC-USD", signal, PortfolioContext(cash=1_000.0), price=50_000.0,
         stop_loss=52_000.0, take_profit=45_000.0,
+        futures_execution_intent="enter",
     )
-    assert order.side == "sell"  # short: no held position required
+    assert order.side == "sell"
+    assert order.futures_execution_intent == "enter"
     assert order.cost == pytest.approx(250.0)
 
 
@@ -322,6 +385,7 @@ def test_gated_plan_leverage_scales_notional_not_margin(tmp_path, monkeypatch):
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0, leverage=5.0,
         stop_loss=40_000.0, take_profit=60_000.0,
+        futures_execution_intent="enter",
     )
     assert order.leverage == 5.0
     assert order.cost == pytest.approx(10.0)  # $50 risk budget at $10,000 stop distance
@@ -347,6 +411,7 @@ def test_plan_below_minimum_notional_is_refused(tmp_path, monkeypatch):
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=20.0), price=50_000.0,
         stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
     )  # risk-sized notional is below the exchange minimum
     assert order.side is None
     assert "minimum" in order.reason
@@ -377,6 +442,7 @@ def test_plan_order_resolves_off_whitelist_override_through_metadata(tmp_path, m
     order = executor.plan_order(
         "NEAR-USD", "Buy", PortfolioContext(cash=1_000.0), price=5.0,
         stop_loss=4.8, take_profit=5.5,
+        futures_execution_intent="enter",
     )
     assert order.side == "buy"
     assert order.ccxt_symbol == "NEAR/USDT:USDT"  # the metadata unified key, not a synthesized one
@@ -407,6 +473,7 @@ def test_plan_leverage_above_default_cap_returns_no_order_plan(tmp_path, monkeyp
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0, leverage=3.0,
         stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
     )
     assert order.side is None
     assert "leverage" in order.reason
@@ -422,6 +489,7 @@ def test_plan_notional_above_zero_default_exposure_cap_is_rejected(tmp_path, mon
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0, leverage=3.0,
         stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
     )
     assert order.side is None
     assert "derivatives notional" in order.reason
@@ -442,6 +510,7 @@ def test_plan_within_raised_caps_passes(tmp_path, monkeypatch):
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0, leverage=3.0,
         stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
     )
     # notional 750 = 75% per-asset (<= 100), 75% total exposure (<= 80) and
     # 75% derivatives exposure (<= 80)
@@ -589,6 +658,7 @@ def test_margin_mode_already_set_does_not_block_the_entry(tmp_path, monkeypatch)
     order = executor.plan_order(
         "BTC-USD", "Buy", book, price=50_000.0, stop_loss=48_000.0,
         take_profit=55_000.0, margin_mode="isolated",
+        futures_execution_intent="enter",
     )
 
     order_id = executor.execute_order(order, confirm=True, portfolio=book)
@@ -614,6 +684,7 @@ def test_live_execute_sets_leverage_before_create_order(tmp_path, monkeypatch):
     order = executor.plan_order(
         "BTC-USD", "Buy", book, price=50_000.0, leverage=5.0,
         stop_loss=40_000.0, take_profit=60_000.0,
+        futures_execution_intent="enter",
     )
     executor.execute_order(order, confirm=True, portfolio=book)
     leverage_calls = [call for call in exchange.calls if call[0] == "set_leverage"]
@@ -638,6 +709,7 @@ def test_agent_terms_drive_sizing_and_margin_mode(tmp_path, monkeypatch):
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
         leverage=2.0, stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
         risk_fraction=0.002, margin_fraction=0.05, margin_mode="isolated",
     )
 
@@ -664,21 +736,27 @@ def test_agent_terms_above_the_hard_caps_are_refused(tmp_path, monkeypatch):
 
     over_risk = executor.plan_order(
         "BTC-USD", "Buy", book, price=50_000.0, leverage=1.0,
-        stop_loss=48_000.0, take_profit=55_000.0, risk_fraction=0.5,
+        stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
+        risk_fraction=0.5,
     )
     assert over_risk.side is None
     assert "hard cap" in (over_risk.reason or "")
 
     over_margin = executor.plan_order(
         "BTC-USD", "Buy", book, price=50_000.0, leverage=1.0,
-        stop_loss=48_000.0, take_profit=55_000.0, margin_fraction=0.9,
+        stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
+        margin_fraction=0.9,
     )
     assert over_margin.side is None
     assert "hard cap" in (over_margin.reason or "")
 
     bad_mode = executor.plan_order(
         "BTC-USD", "Buy", book, price=50_000.0, leverage=1.0,
-        stop_loss=48_000.0, take_profit=55_000.0, margin_mode="portfolio",
+        stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
+        margin_mode="portfolio",
     )
     assert bad_mode.side is None
     assert "margin_mode" in (bad_mode.reason or "")
@@ -702,7 +780,9 @@ def test_live_execution_sets_margin_mode_before_leverage_and_entry(tmp_path, mon
     book = PortfolioContext(cash=1_000.0)
     order = executor.plan_order(
         "BTC-USD", "Buy", book, price=50_000.0, leverage=2.0,
-        stop_loss=48_000.0, take_profit=55_000.0, margin_mode="isolated",
+        stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
+        margin_mode="isolated",
     ).model_copy(update={"stop_loss": 48_000.0, "take_profit": 55_000.0})
 
     executor.execute_order(order, confirm=True, portfolio=book)
@@ -1254,7 +1334,8 @@ def test_live_bracket_short_closes_buy_with_reduce_only(tmp_path, monkeypatch):
     )
     book = PortfolioContext(cash=1_000.0)
     order = executor.plan_order("BTC-USD", "Sell", book, price=50_000.0,
-                                stop_loss=52_000.0, take_profit=45_000.0)
+                                stop_loss=52_000.0, take_profit=45_000.0,
+                                futures_execution_intent="enter")
     executor.execute_order(order, confirm=True, portfolio=book)
     bracket_calls = [call for call in exchange.calls
                      if call[0] == "create_order" and call[5]]
@@ -1273,7 +1354,8 @@ def test_live_entry_without_bracket_is_refused_before_any_order(tmp_path, monkey
         env=live_env(),
     )
     order = executor.plan_order("BTC-USD", "Buy", PortfolioContext(cash=1_000.0),
-                                price=50_000.0)
+                                price=50_000.0,
+                                futures_execution_intent="enter")
     assert order.side is None
     assert "explicit stop_loss" in order.reason
 
