@@ -335,6 +335,11 @@ def _scheduler_loop() -> None:
                 _spawn_cycle()
 
 
+def cycle_running() -> bool:
+    """True while a cycle holds the lock (other surfaces must not reconfigure under it)."""
+    return _cycle_lock.locked()
+
+
 def _spawn_cycle(graph_builder: Callable | None = None) -> str:
     """Run one cycle on a worker thread unless one is already running."""
     global _cycle_thread
@@ -510,29 +515,37 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
             stock_universe,
         )
 
-        # Venue first: in futures mode the universe is built FROM the venue —
-        # the settle assets the futures wallet holds, then the contracts
-        # settled in them — so nothing untradable reaches the scoring pool.
-        _cycle_timeout(deadline, "venue setup")
-        with telemetry.span("venue_setup"):
-            bridge = _build_bridge(config)
-            derivatives = _build_derivatives_executor(config) if config.get("exec_derivatives") is True else None
+        # Futures mode builds the universe FROM the venue — the settle assets
+        # the futures wallet holds, then the contracts settled in them — so the
+        # derivatives executor exists before screening. The spot bridge is
+        # still built only after a successful screen.
+        derivatives = None
+        if config.get("exec_derivatives") is True:
+            _cycle_timeout(deadline, "venue setup")
+            with telemetry.span("venue_setup"):
+                derivatives = _build_derivatives_executor(config)
 
         contracts: dict[str, dict] = {}
+        screen_fn = screen_universe
         universe_fns = (crypto_universe, stock_universe)
         if derivatives is not None:
+            build_fn = _futures_crypto_universe(derivatives, contracts, summary)
             universe_fns = (
-                _futures_crypto_universe(derivatives, contracts, summary),
+                build_fn,
                 lambda _config, _top_n: [],  # stocks have no futures contract
             )
+            screen_fn = getattr(build_fn, "screen_fn", screen_universe)
 
         with telemetry.span("screening"):
             crypto, stocks, candidates = _screen_with_timeout(
-                *universe_fns, screen_universe, config, _today_iso(),
+                *universe_fns, screen_fn, config, _today_iso(),
                 telemetry=telemetry,
             )
             _cycle_timeout(deadline, "screening")
         summary["universe"] = {"crypto": len(crypto), "stock": len(stocks)}
+        _cycle_timeout(deadline, "venue setup")
+        with telemetry.span("venue_setup"):
+            bridge = _build_bridge(config)
         mismatched: list[dict] = []
         for candidate in list(candidates):
             contract = contracts.get(str(candidate.get("ticker")))
@@ -762,32 +775,79 @@ def _futures_crypto_universe(derivatives: Any, contracts: dict, summary: dict) -
     """Universe builder for futures mode, run inside the screening timeout.
 
     Reads which settle assets the futures wallet holds (intersected with
-    exec_futures_settle_currencies), then the liquid perpetuals settled in
-    them. Fills ``contracts`` (ticker -> contract row) for pinning afterwards.
+    exec_futures_settle_currencies), then the most liquid perpetual settled
+    in each of them. A base asset is assigned only to the best-funded settle
+    asset whose contract it can fill, so the same coin does not appear twice.
+    Fills ``contracts`` (ticker -> contract row) for pinning afterwards.
     """
     from tradingagents.dataflows.screening import (
+        _benchmark_momentum,
         _public_futures_ranking_client,
-        futures_universe,
+        futures_universe_by_settle,
+        screen_one,
     )
     from tradingagents.execution.futures_account import read_futures_settle_balances
 
+    bridge = derivatives._bridge
+    balances = read_futures_settle_balances(bridge)
+    settles = bridge.futures_settle_currencies() & set(balances)
+    summary["settle_assets"] = sorted(settles)
+
     def build(config: dict, _top_n: int) -> list[str]:
-        bridge = derivatives._bridge
-        balances = read_futures_settle_balances(bridge)
-        settles = bridge.futures_settle_currencies() & set(balances)
-        summary["settle_assets"] = sorted(settles)
         if not settles:
             logger.warning("autoloop: futures wallet holds no allowed settle asset (%s)", balances)
             return []
         try:
             ranking = _public_futures_ranking_client(config)
-        except Exception as exc:  # noqa: BLE001 - fall back to venue volumes
-            logger.warning("autoloop: production volume ranking unavailable (%s)", exc)
-            ranking = None
-        rows = futures_universe(bridge.client(), settles, FUTURES_UNIVERSE_SIZE, ranking_client=ranking)
+        except Exception as exc:  # noqa: BLE001 - fail closed, see below
+            # Demo Trading reports synthetic volumes, so ranking on the venue
+            # would rank by fake liquidity. Without the production ranking
+            # there is no trustworthy universe; skip the cycle instead.
+            logger.warning(
+                "autoloop: production volume ranking unavailable (%s); "
+                "futures universe skipped", exc,
+            )
+            summary["universe_error"] = f"ranking_unavailable: {exc}"
+            return []
+        rows = futures_universe_by_settle(
+            bridge.client(), settles, balances, ranking_client=ranking
+        )
         contracts.update({row["ticker"]: row for row in rows})
         return [row["ticker"] for row in rows]
 
+    def screen_fn(
+        crypto_tickers: list[str],
+        _stocks: list[str],
+        trade_date: str,
+        top_n: int,
+        lookback: int = 20,
+    ) -> list[dict]:
+        """Futures screen preserves the per-settle liquidity order.
+
+        ``screen_one`` still fetches the Yahoo close so the downstream price-
+        mismatch check can run, but the candidate score is overridden to keep
+        the most-funded, most-liquid settle asset first.
+        """
+        benchmark = _benchmark_momentum("crypto", trade_date, lookback)
+        candidates = []
+        for idx, ticker in enumerate(crypto_tickers):
+            if ticker not in contracts:
+                continue
+            candidate = screen_one(
+                ticker,
+                trade_date,
+                asset_type="crypto",
+                benchmark_momentum=benchmark,
+                lookback=lookback,
+            )
+            if candidate is None:
+                continue
+            candidate.score = float(len(crypto_tickers) - idx)
+            candidates.append(candidate)
+        candidates.sort(key=lambda c: -c.score)
+        return [c.as_dict() for c in candidates[:top_n]]
+
+    build.screen_fn = screen_fn
     return build
 
 
@@ -1466,7 +1526,7 @@ async def halt_now(request: Request):
     gated — a kill switch must always work."""
     await json_body(request)  # CSRF §0: application/json required, body may be {}
     # The timestamp is what makes the halt day-scoped (risk.py:111-119): a
-    # halt line without one would be ignored by _halted_today.
+    # halt line without one would be ignored by _halted.
     append_event(get_config()["exec_log_path"], {
         "event": "halt",
         "timestamp": datetime.now(timezone.utc).isoformat(),

@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import pytest
 
-from tradingagents.dataflows.screening import futures_universe
+from tradingagents.dataflows.screening import futures_universe, futures_universe_by_settle
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.execution import ExchangeBridge
 from tradingagents.execution.futures_account import (
@@ -155,3 +155,37 @@ def test_momentum_with_zero_start_price_is_undefined():
 
     assert _momentum(pd.Series([0.0, 1.0, 2.0]), 2) is None
     assert _momentum(pd.Series([1.0, 1.5, 2.0]), 2) == 100.0
+
+
+def test_universe_by_settle_picks_one_per_asset_and_skips_duplicate_bases():
+    # USDT is better funded, so it picks first. BTC/USDT is the most liquid
+    # USDT contract. USDC must then skip BTC/USDC because BTC is already used
+    # and fall back to its next most liquid contract, SOL/USDC.
+    balances = {"USDT": 5000.0, "USDC": 1200.0}
+    rows = futures_universe_by_settle(
+        _Venue(MARKETS), {"USDT", "USDC"}, balances, ranking_client=_Venue({}, RANKING)
+    )
+    assert [(r["ticker"], r["futures_symbol"]) for r in rows] == [
+        ("BTC-USD", "BTC/USDT:USDT"),
+        ("SOL-USD", "SOL/USDC:USDC"),
+    ]
+
+
+def test_universe_by_settle_order_respects_wallet_balance():
+    # With USDC better funded, it picks BTC/USDC first. USDT then cannot reuse
+    # BTC and picks its next most liquid allowed contract (ENA/USDT; 1000PEPE
+    # and stablecoin bases are excluded, OLD is inactive).
+    balances = {"USDT": 1200.0, "USDC": 5000.0}
+    rows = futures_universe_by_settle(
+        _Venue(MARKETS), {"USDT", "USDC"}, balances, ranking_client=_Venue({}, RANKING)
+    )
+    assert [(r["ticker"], r["settle"]) for r in rows] == [
+        ("BTC-USD", "USDC"),
+        ("ENA-USD", "USDT"),
+    ]
+
+
+def test_universe_by_settle_is_empty_without_balances():
+    assert futures_universe_by_settle(
+        _Venue(MARKETS), {"USDT", "USDC"}, {}, ranking_client=_Venue({}, RANKING)
+    ) == []

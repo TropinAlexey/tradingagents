@@ -111,9 +111,9 @@ def _public_exchange(config: dict):
     exchange = exchange_class({"enableRateLimit": True})
     if exchange_id == "binance":
         base_url = str(config.get("exec_base_url") or "https://demo-api.binance.com")
-        from tradingagents.execution.bridge import _binance_profile
+        from tradingagents.execution.bridge import binance_profile
 
-        profile = _binance_profile(base_url)
+        profile = binance_profile(base_url)
         if profile == "demo":
             enable_demo_trading = getattr(exchange, "enable_demo_trading", None)
             if not callable(enable_demo_trading):
@@ -263,6 +263,101 @@ def futures_universe(
             }
     ranked = sorted(best.values(), key=lambda row: -row["quote_volume"])
     return ranked[:top_n]
+
+
+def futures_universe_by_settle(
+    venue_client,
+    settle_assets: set[str] | frozenset[str],
+    wallet_balances: dict[str, float],
+    *,
+    ranking_client=None,
+) -> list[dict]:
+    """One liquid perpetual per settle asset held in the futures wallet.
+
+    Within each settle asset (USDT, USDC, ...) the most liquid contract is
+    chosen, but a base asset that already won a more-funded settle asset is
+    skipped so the same coin does not appear twice.  ``wallet_balances``
+    decides the settle-asset order: the asset with the largest balance picks
+    first, because that is where the margin is actually available.
+    """
+    settles = {str(asset).strip().upper() for asset in settle_assets}
+    if not settles:
+        return []
+    positive_balances = {a: v for a, v in wallet_balances.items() if v > 0}
+    if not positive_balances:
+        return []
+    try:
+        markets = venue_client.load_markets()
+    except Exception as exc:  # noqa: BLE001 — any ccxt/network failure degrades
+        raise VendorError(f"futures universe unavailable: {exc}") from exc
+
+    by_settle: dict[str, list[dict]] = {s: [] for s in settles}
+    for symbol, market in markets.items():
+        if not isinstance(market, dict) or not isinstance(symbol, str):
+            continue
+        if market.get("type") != "swap" or market.get("contract") is not True:
+            continue
+        if market.get("active") is False or market.get("linear") is not True:
+            continue
+        settle = str(market.get("settle") or "").upper()
+        base = str(market.get("base") or "").upper()
+        quote = str(market.get("quote") or "").upper()
+        if settle not in settles or quote != settle:
+            continue
+        if not base or base[0].isdigit() or base in _STABLECOIN_BASES:
+            continue
+        info = market.get("info") if isinstance(market.get("info"), dict) else {}
+        underlying = info.get("underlyingType")
+        if underlying is not None and str(underlying).upper() != "COIN":
+            continue
+        by_settle[settle].append({"symbol": symbol, "base": base, "settle": settle})
+
+    try:
+        tickers = (ranking_client or venue_client).fetch_tickers()
+    except Exception as exc:  # noqa: BLE001
+        raise VendorError(f"futures volume ranking unavailable: {exc}") from exc
+
+    scored: dict[str, list[dict]] = {}
+    for settle, contracts in by_settle.items():
+        rows: list[dict] = []
+        for contract in contracts:
+            ticker = tickers.get(contract["symbol"]) if isinstance(tickers, dict) else None
+            try:
+                quote_volume = float((ticker or {}).get("quoteVolume") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if quote_volume < MIN_CRYPTO_QUOTE_VOLUME_USD:
+                continue
+            try:
+                last_price = float((ticker or {}).get("last") or 0.0) or None
+            except (TypeError, ValueError):
+                last_price = None
+            rows.append({
+                "ticker": f"{contract['base']}-USD",
+                "futures_symbol": contract["symbol"],
+                "settle": contract["settle"],
+                "quote_volume": quote_volume,
+                "last_price": last_price,
+            })
+        rows.sort(key=lambda row: -row["quote_volume"])
+        scored[settle] = rows
+
+    ordered_settles = sorted(
+        positive_balances,
+        key=lambda asset: -positive_balances[asset],
+    )
+    used_bases: set[str] = set()
+    result: list[dict] = []
+    for settle in ordered_settles:
+        for row in scored.get(settle, []):
+            base = row["ticker"].split("-", 1)[0]
+            if base in used_bases:
+                continue
+            used_bases.add(base)
+            result.append(row)
+            break
+    result.sort(key=lambda row: -row["quote_volume"])
+    return result
 
 
 # A screened Yahoo close further than this from the contract's last price
