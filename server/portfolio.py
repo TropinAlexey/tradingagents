@@ -1,7 +1,7 @@
 """Portfolio: GET /api/portfolio (docs/ui-api-contract.md §6).
 
 Realized P&L is a FIFO replay of the engine's audit log, reusing the risk
-module's own helpers (``_replay`` / ``_consecutive_losses`` / ``_halted_today``
+module's own helpers (``_replay`` / ``_consecutive_losses`` / ``_halted``
 — the private seam §11.14 accepts). Positions come from
 ``bridge.sync_portfolio()`` in live mode; in dry mode the venue is never
 touched — the engine's own rule is that dry never reaches the exchange — so
@@ -21,7 +21,7 @@ from server import audit as audit_log
 from server.contract import ApiError, utc_now_iso
 from tradingagents.dataflows.config import get_config
 from tradingagents.execution.futures_account import read_futures_account
-from tradingagents.execution.risk import _consecutive_losses, _halted_today, _replay
+from tradingagents.execution.risk import _consecutive_losses, _halted, _replay
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
 
@@ -200,7 +200,7 @@ def get_portfolio():
                 closed, int(config.get("risk_max_consecutive_loss_count") or 3)
             ),
         },
-        "halted_today": _halted_today(events, today),
+        "halted_today": _halted(events),
         "warnings": warnings,
         "stale_after": STALE_AFTER,
         "futures": futures,

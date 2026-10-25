@@ -458,7 +458,7 @@ def test_halt_writes_kill_switch_line_and_health_reflects_it(client, tmp_path):
     events = [json.loads(line) for line in audit_file.read_text(encoding="utf-8").splitlines() if line.strip()]
     (halt,) = [event for event in events if event.get("event") == "halt"]
     # the timestamp is what makes the halt day-scoped (risk.py:111-119): a
-    # halt line without one would be invisible to _halted_today.
+    # halt line without one would be invisible to _halted.
     assert halt["timestamp"].startswith(_today())
 
     body = client.get("/api/health").json()

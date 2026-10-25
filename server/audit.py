@@ -65,14 +65,15 @@ def read_events() -> tuple[list[dict], int]:
 
 
 def halt_state(events: list[dict] | None = None) -> tuple[bool, str | None]:
-    """(halted_today, last halt reason), per risk.py:163-173: a halt line today
-    not yet followed by a halt_reset today. Raises 503 when the log is
-    unreadable — the approval gate must fail closed with the execute path."""
+    """(halted, last halt reason), per risk.py: a halt line not yet followed by
+    a halt_reset. Halts no longer self-expire at UTC midnight. Raises 503 when
+    the log is unreadable — the approval gate must fail closed with the execute
+    path."""
     if events is None:
         events, _ = read_events()
-    from tradingagents.execution.risk import _halted_today
+    from tradingagents.execution.risk import _halted
 
-    halted = _halted_today(events, datetime.now(timezone.utc).date())
+    halted = _halted(events)
     reason = None
     for event in events:
         if event.get("event") == "halt":

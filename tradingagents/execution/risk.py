@@ -7,49 +7,54 @@ caller's PortfolioContext plus an injectable ``price_of`` for marking.
 Interpretation pinned here, because the L1 audit carries no order ids that
 match a buy to its sell:
 
-- P&L matching is FIFO per pipeline ticker over ``price_est``: a sell
-  consumes the oldest still-open long lots of the same ticker, across days.
-  A derivatives sell beyond any long lots OPENS a short (a negative lot,
-  recognized by the audit line's ``market="derivatives"``); a later buy
-  covers open shorts first at entry-minus-exit P&L, the mirror of a long's.
-  A closing trade with no open lot (a position bought before logging began)
-  has an unknown basis: it is excluded from the daily P&L and skipped --
-  neither counted nor streak-breaking -- by the consecutive-loss walk.
+- P&L matching is FIFO per pipeline ticker over ``price_exec`` when the
+  audit line records an executed fill, otherwise ``price_est`` for legacy
+  or dry-run lines. A sell consumes the oldest still-open long lots of the
+  same ticker, across days. A derivatives sell beyond any long lots OPENS a
+  short (a negative lot, recognized by the audit line's
+  ``market="derivatives"``); a later buy covers open shorts first at
+  entry-minus-exit P&L, the mirror of a long's. A closing trade with no
+  open lot (a position bought before logging began) has an unknown basis:
+  it is excluded from the daily P&L and skipped -- neither counted nor
+  streak-breaking -- by the consecutive-loss walk. Recorded ``fee`` values
+  (quote-equivalent) are subtracted from matched realized P&L so the guard
+  sees the cost of execution, not the mid-price fantasy.
 - Realized trades classify the consecutive-loss streak backwards from the
   newest event across all days: a losing sell extends it, a profitable sell
   ends it, an unknown-basis sell is skipped. ``max_consecutive_loss_count``
   is absolute -- it never needs an equity denominator, so it keeps working
   on days the percentage checks cannot.
-- Halts are day-scoped and sticky: once a ``{"event": "halt"}`` line exists
-  for the current UTC day without a following ``{"event": "halt_reset"}``,
-  every check returns halted until ``reset_halt()`` is called or the UTC day
-  rolls over (the halt self-expires). Breaching either the consecutive-loss
-  cap or the daily-loss cap appends the halt line itself, once per day. Two
-  events forgive everything before them -- a halt line (that breach already
-  fired the kill switch once, so a day rollover starts a fresh window) and
-  a halt_reset (the operator's explicit decision for the day): breach
-  conditions are re-evaluated only over events AFTER the newest of those,
-  so a forgiven breach cannot re-fire the halt -- while a new breach after
-  the forgiveness point still can. One accepted tradeoff: a lot opened
-  BEFORE the forgiveness point drops out of the daily-loss figure until it
-  is closed (its close lands after the point and counts then); an ongoing
-  unrealized loss on that lot can therefore drift past the cap for the
-  rest of the UTC day without re-firing the halt.
+- Halts are sticky until explicitly cleared: once a ``{"event": "halt"}``
+  line exists without a following ``{"event": "halt_reset"}``, every check
+  returns halted until ``reset_halt()`` is called. A UTC day rollover does
+  NOT lift the halt automatically; the operator must confirm that the
+  kill-switch should be disarmed. Breaching either the consecutive-loss cap
+  or the daily-loss cap appends the halt line itself. Two events forgive
+  realized P&L before them -- a halt line (that breach already fired the
+  kill switch once) and a halt_reset (the operator's explicit decision for
+  the day): realized breach conditions are re-evaluated only over events
+  AFTER the newest of those, so a forgiven breach cannot re-fire the halt.
+  Unrealized P&L on open lots is always counted in the daily-loss figure
+  regardless of when the lot was opened, because a position that loses
+  value today is today's risk regardless of its entry date.
 - Equity is ``cash + sum(position quantity x current price)`` from the
   PortfolioContext. When it cannot be computed (no portfolio, or cash None
-  with no positions), the percentage checks are skipped fail-open with the
-  reason recorded on the decision -- the halt machinery above still fires.
+  with no positions), plan-time percentage checks are skipped fail-open
+  with the reason recorded on the decision -- the halt machinery above
+  still fires. Execute-time re-checks (``fail_closed=True``) refuse the
+  order instead, because sending without a computable equity denominator
+  would silently disarm the percentage limits.
 
 Fail-open, deliberately: a ``price_of`` that raises or returns None is
 treated as "no price", the affected value is skipped and logged. Only the
-consecutive-loss cap is immune to missing data. One deliberate exception to
-the fail-open stance: the execute-time re-check (``check(...,
+consecutive-loss cap is immune to missing data. Two deliberate exceptions
+to the fail-open stance: the execute-time re-check (``check(...,
 fail_closed=True)``, called wherever a real order is about to be sent)
-reads the log FAIL-CLOSED -- an unreadable audit log hides the halt and
-loss-streak state exactly when a send is being decided, so the caller must
-refuse ("audit log unreadable; failing closed") instead of passing.
-Plan-time checks keep the fail-open read: a blind plan must not fabricate
-a halt either way.
+reads the log FAIL-CLOSED -- an unreadable audit log or any corrupt line
+hides the halt and loss-streak state exactly when a send is being decided,
+so the caller must refuse ("audit log unreadable; failing closed") instead
+of passing. Plan-time checks keep the fail-open read: a blind plan must
+not fabricate a halt either way.
 """
 
 from __future__ import annotations
@@ -125,14 +130,11 @@ def _read_events(
     """Every parseable JSON line in file order (append-only => chronological).
 
     A missing file is a fresh log. An unreadable log (permission, wrong
-    parent type) reads as empty fail-open -- the write side fails loudly
-    anyway, and a blind guard must not fabricate a halt either way. Corrupt
-    lines are skipped with a warning.
-
-    ``fail_closed=True`` (execute-time re-checks) returns None instead when
-    the log EXISTS but cannot be read: the halt and loss-streak state would
-    be invisible to a send decision, so the caller must refuse. A missing
-    file is still a fresh log and never returns None.
+    parent type) reads as empty fail-open at plan time, but returns None
+    when ``fail_closed=True`` so the execute-time caller can refuse. Corrupt
+    lines are skipped with a warning at plan time; at execute time even a
+    single corrupt line returns None, because a partially-readable log can
+    hide a halt or a losing streak exactly when a send is being decided.
     """
     target = Path(path).expanduser()
     try:
@@ -146,6 +148,7 @@ def _read_events(
         logger.warning("risk: cannot read audit log %s (%r); treating as empty", target, exc)
         return []
     events: list[dict[str, Any]] = []
+    had_corrupt = False
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -153,23 +156,40 @@ def _read_events(
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            had_corrupt = True
             logger.warning("risk: skipping unparseable audit line in %s", target)
             continue
         if isinstance(event, dict):
             events.append(event)
+        else:
+            had_corrupt = True
+            logger.warning("risk: skipping non-object audit line in %s", target)
+    if fail_closed and had_corrupt:
+        logger.warning("risk: audit log %s has corrupt lines; failing closed", target)
+        return None
     return events
 
 
-def _halted_today(events: list[dict[str, Any]], today: date) -> bool:
-    """Sticky halt: a halt line today not yet followed by a halt_reset today."""
+def _halted(events: list[dict[str, Any]]) -> bool:
+    """Sticky halt: a halt line not yet followed by a halt_reset.
+
+    The halt persists across UTC day rollovers until the operator explicitly
+    calls ``reset_halt()``; an automatic next-day expiry would silently re-arm
+    trading after a breach. Halt/reset lines without a usable timestamp are
+    ignored: the operator cannot disarm a halt whose origin is unknown.
+    """
     halted = False
     for event in events:
         kind = event.get("event")
         if kind not in ("halt", "halt_reset"):
             continue
-        if _event_date(event) != today:
-            continue  # day-scoped: a halt from a previous day has expired
-        halted = kind == "halt"
+        if _event_datetime(event) is None:
+            logger.warning("risk: ignoring %s line without usable timestamp", kind)
+            continue
+        if kind == "halt":
+            halted = True
+        elif kind == "halt_reset":
+            halted = False
     return halted
 
 
@@ -223,26 +243,61 @@ def _after_reset(when: datetime | None, considered_from: datetime | None) -> boo
 class _Lot:
     """One open lot awaiting a FIFO match; negative quantity = a short."""
 
-    __slots__ = ("quantity", "price", "opened", "opened_when")
+    __slots__ = ("quantity", "price", "opened", "opened_when", "fee")
 
     def __init__(
-        self, quantity: float, price: float, opened: date, opened_when: datetime
+        self,
+        quantity: float,
+        price: float,
+        opened: date,
+        opened_when: datetime,
+        fee: float = 0.0,
     ) -> None:
         self.quantity = quantity
         self.price = price
         self.opened = opened
         self.opened_when = opened_when
+        self.fee = fee
 
 
 class _ClosedTrade:
     """One FIFO-matched close: realized P&L, or None when the basis is unknown."""
 
-    __slots__ = ("day", "pnl", "when")
+    __slots__ = ("day", "pnl", "when", "fee")
 
-    def __init__(self, day: date, pnl: float | None, when: datetime) -> None:
+    def __init__(
+        self, day: date, pnl: float | None, when: datetime, fee: float = 0.0
+    ) -> None:
         self.day = day
         self.pnl = pnl
         self.when = when
+        self.fee = fee
+
+
+def _event_price(event: dict[str, Any]) -> float | None:
+    """Best available price: execution fill price wins over estimate."""
+    for key in ("price_exec", "price_est"):
+        value = event.get(key)
+        if isinstance(value, (int, float)):
+            price = float(value)
+            if price > 0:
+                return price
+    return None
+
+
+def _event_fee(event: dict[str, Any]) -> float:
+    """Quote-equivalent fee recorded on the audit line, if any."""
+    fee = event.get("fee")
+    if isinstance(fee, (int, float)):
+        return max(float(fee), 0.0)
+    return 0.0
+
+
+def _allocate_fee(total_fee: float, matched: float, total: float) -> float:
+    """Return the portion of ``total_fee`` attributable to ``matched`` qty."""
+    if total <= _QTY_EPSILON or matched <= _QTY_EPSILON or total_fee <= 0:
+        return 0.0
+    return total_fee * (matched / total)
 
 
 def _replay(events: list[dict[str, Any]]) -> tuple[list[_ClosedTrade], dict[str, deque[_Lot]]]:
@@ -284,16 +339,16 @@ def _replay(events: list[dict[str, Any]]) -> tuple[list[_ClosedTrade], dict[str,
             continue
         when = _event_datetime(event)
         quantity = event.get("qty")
-        price = event.get("price_est")
+        price = _event_price(event)
         ticker = event.get("ticker")
-        if when is None or ticker is None:
+        if when is None or ticker is None or price is None:
             continue
-        if not isinstance(quantity, (int, float)) or not isinstance(price, (int, float)):
+        if not isinstance(quantity, (int, float)):
             continue
         quantity = float(quantity)
-        price = float(price)
-        if quantity <= 0 or price <= 0:
+        if quantity <= 0:
             continue
+        fee = _event_fee(event)
         day = when.date()
         queue = lots.setdefault(ticker, deque())
         if action == "buy":
@@ -303,19 +358,26 @@ def _replay(events: list[dict[str, Any]]) -> tuple[list[_ClosedTrade], dict[str,
             remaining = quantity
             pnl = 0.0
             matched_any = False
+            closed_fee = 0.0
             while remaining > _QTY_EPSILON and queue and queue[0].quantity < 0:
                 lot = queue[0]
-                matched = min(remaining, -lot.quantity)
-                pnl += (lot.price - price) * matched
+                lot_qty = -lot.quantity
+                matched = min(remaining, lot_qty)
+                entry_fee = _allocate_fee(lot.fee, matched, lot_qty)
+                exit_fee = _allocate_fee(fee, matched, quantity)
+                pnl += (lot.price - price) * matched - entry_fee - exit_fee
                 lot.quantity += matched
+                lot.fee -= entry_fee
                 remaining -= matched
                 matched_any = True
+                closed_fee += entry_fee + exit_fee
                 if -lot.quantity <= _QTY_EPSILON:
                     queue.popleft()
             if matched_any:
-                closed.append(_ClosedTrade(day, pnl, when))
+                closed.append(_ClosedTrade(day, pnl, when, closed_fee))
             if remaining > _QTY_EPSILON:
-                queue.append(_Lot(remaining, price, day, when))
+                remaining_fee = _allocate_fee(fee, remaining, quantity)
+                queue.append(_Lot(remaining, price, day, when, remaining_fee))
             continue
         # sell: close the oldest long lots first; leftover has an unknown
         # basis on spot, while a derivatives sell's leftover OPENS a short
@@ -324,18 +386,24 @@ def _replay(events: list[dict[str, Any]]) -> tuple[list[_ClosedTrade], dict[str,
         remaining = quantity
         pnl = 0.0
         matched_any = False
+        closed_fee = 0.0
         while remaining > _QTY_EPSILON and queue and queue[0].quantity > 0:
             lot = queue[0]
             matched = min(remaining, lot.quantity)
-            pnl += (price - lot.price) * matched
+            entry_fee = _allocate_fee(lot.fee, matched, lot.quantity)
+            exit_fee = _allocate_fee(fee, matched, quantity)
+            pnl += (price - lot.price) * matched - entry_fee - exit_fee
             lot.quantity -= matched
+            lot.fee -= entry_fee
             remaining -= matched
             matched_any = True
+            closed_fee += entry_fee + exit_fee
             if lot.quantity <= _QTY_EPSILON:
                 queue.popleft()
         if event.get("market") == "derivatives" and remaining > _QTY_EPSILON:
-            queue.append(_Lot(-remaining, price, day, when))
-        closed.append(_ClosedTrade(day, pnl if matched_any else None, when))
+            remaining_fee = _allocate_fee(fee, remaining, quantity)
+            queue.append(_Lot(-remaining, price, day, when, remaining_fee))
+        closed.append(_ClosedTrade(day, pnl if matched_any else None, when, closed_fee if matched_any else 0.0))
     return closed, lots
 
 
@@ -409,11 +477,13 @@ class RiskGuard:
         today: date,
         considered_from: datetime | None = None,
     ) -> float:
-        """Today's realized P&L plus unrealized on lots opened today, marked now.
+        """Today's realized P&L plus unrealized on all open lots, marked now.
 
-        Trades and lots at or before the forgiveness point (the newest halt
+        Realized trades at or before the forgiveness point (the newest halt
         line, or today's halt_reset) are already-forgiven history: they stay
         out of the figure so a forgiven breach cannot re-fire the halt.
+        Unrealized P&L on open lots is always counted, because a position
+        that loses value today is today's risk no matter when it was opened.
         """
         pnl = 0.0
         for trade in closed:
@@ -427,18 +497,16 @@ class RiskGuard:
             current = self._price(ticker)
             if current is None:
                 for lot in queue:
-                    if lot.opened == today and _after_reset(lot.opened_when, considered_from):
-                        logger.warning(
-                            "risk: cannot mark open lot %r (%s bought at %s); "
-                            "its unrealized P&L is excluded from the daily figure",
-                            ticker,
-                            lot.quantity,
-                            lot.price,
-                        )
+                    logger.warning(
+                        "risk: cannot mark open lot %r (%s at %s); "
+                        "its unrealized P&L is excluded from the daily figure",
+                        ticker,
+                        lot.quantity,
+                        lot.price,
+                    )
                 continue
             for lot in queue:
-                if lot.opened == today and _after_reset(lot.opened_when, considered_from):
-                    pnl += (current - lot.price) * lot.quantity
+                pnl += (current - lot.price) * lot.quantity
         return pnl
 
     def check(
@@ -452,13 +520,15 @@ class RiskGuard:
         """Evaluate ``order_plan`` against the limits; never raises for risk.
 
         Halted always wins: the audit log is the shared, cross-process state,
-        so a halt appended by any process blocks every check until reset or
-        day rollover. Percentage checks run only when equity is computable;
-        the consecutive-loss cap always runs. ``fail_closed=True`` marks an
-        execute-time re-check (a send is being decided): an audit log that
-        exists but cannot be read then REFUSES the order instead of passing,
-        because the halt and streak state is unverifiable. Plan-time checks
-        keep the documented fail-open read.
+        so a halt appended by any process blocks every check until reset.
+        Halts do NOT self-expire at UTC midnight. Percentage checks run only
+        when equity is computable; the consecutive-loss cap always runs.
+        ``fail_closed=True`` marks an execute-time re-check (a send is being
+        decided): an audit log that exists but cannot be read, or that
+        contains any corrupt line, then REFUSES the order instead of passing,
+        because the halt and streak state is unverifiable. A missing
+        computable equity also refuses the order when ``fail_closed=True``.
+        Plan-time checks keep the documented fail-open read.
         """
         path = Path(audit_log).expanduser()
         events = _read_events(path, fail_closed=fail_closed)
@@ -469,11 +539,11 @@ class RiskGuard:
                 reason="audit log unreadable; failing closed",
             )
         today = _utc_today()
-        if _halted_today(events, today):
+        if _halted(events):
             return RiskDecision(
                 allowed=False,
                 halted=True,
-                reason="risk halt is active for today (audit log); call reset_halt to clear",
+                reason="risk halt is active (audit log); call reset_halt to clear",
             )
 
         closed, open_lots = _replay(events)
@@ -512,6 +582,12 @@ class RiskGuard:
         if equity is None:
             if reasons:
                 return RiskDecision(allowed=False, halted=False, reason="; ".join(reasons))
+            if fail_closed:
+                return RiskDecision(
+                    allowed=False,
+                    halted=False,
+                    reason="portfolio required for fail-closed percentage checks",
+                )
             skipped = (
                 "equity not computable (no portfolio, or cash None with no positions): "
                 "percentage limits skipped fail-open"

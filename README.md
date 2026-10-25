@@ -55,7 +55,7 @@ Full release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 <div align="center">
 
-🚀 [TradingAgents](#tradingagents-framework) | ⚡ [Installation & CLI](#installation-and-cli) | 🎬 [Demo](https://www.youtube.com/watch?v=90gr5lwjIho) | 📦 [Package Usage](#tradingagents-package) | 🤝 [Contributing](#contributing) | 📄 [Citation](#citation)
+🚀 [TradingAgents](#tradingagents-framework) | 🛡️ [Risk Management](#risk-management) | ⚡ [Installation & CLI](#installation-and-cli) | 🎬 [Demo](https://www.youtube.com/watch?v=90gr5lwjIho) | 📦 [Package Usage](#tradingagents-package) | 🤝 [Contributing](#contributing) | 📄 [Citation](#citation)
 
 </div>
 
@@ -102,10 +102,61 @@ Our framework decomposes complex trading tasks into specialized roles.
 ### Risk Management and Portfolio Manager
 - Continuously evaluates portfolio risk by assessing market volatility, liquidity, and other risk factors. The risk management team evaluates and adjusts trading strategies, providing assessment reports to the Portfolio Manager for final decision.
 - The Portfolio Manager approves/rejects the transaction proposal. If approved, the order will be sent to the simulated exchange and executed.
+- Execution-time safety controls — halt, daily loss, slippage guard, and emergency close — are described in the [Risk Management](#risk-management) section below.
 
 <p align="center">
   <img src="assets/risk.png" width="70%" style="display: inline-block; margin: 0 2%;">
 </p>
+
+## Risk Management
+
+TradingAgents ships execution-time risk controls that live next to the exchange bridge and use a shared, append-only `audit.jsonl` as their source of truth. The checks run when a plan is created and again immediately before any order is sent, so a halt appended by another process, the web API, or a human operator always blocks the next live trade.
+
+### Halt / kill switch
+
+A halt is a single sticky line in `audit.jsonl`. Once written, every subsequent order is refused until `reset_halt()` is called or a matching `halt_reset` line is appended. Halts do **not** self-expire at UTC midnight. Append one manually, via the server API, or from any process that writes to the same log.
+
+### Daily loss limit
+
+The daily loss figure combines:
+
+- realized P&L from trades closed today, and
+- unrealized P&L on every open lot, marked to the current market price.
+
+This prevents a position opened earlier from silently drifting past the loss limit. Realized trades before the most recent `halt`/`halt_reset` are excluded, so a forgiven breach cannot re-fire the halt.
+
+### Execution-price P&L and fees
+
+When an order fills, the bridge records the actual execution price (`price_exec`) and the venue's quote-equivalent fee (`fee`) in `audit.jsonl`. The FIFO P&L replay uses the fill price and subtracts the pro-rata fee for each matched lot, so reported P&L matches what the exchange actually charged.
+
+### Fail-closed execute checks
+
+Plan-time checks stay fail-open so rehearsal plans without a portfolio are not falsely rejected. At execute time the check is fail-closed:
+
+- an unreadable or corrupt `audit.jsonl` refuses the order,
+- a missing computable equity refuses the order in live mode,
+- an active halt refuses the order.
+
+### Slippage guard
+
+Set `exec_max_slippage_pct` (or `TRADINGAGENTS_EXEC_MAX_SLIPPAGE_PCT`) to reject a market order when the fresh price deviates from the planned price by more than the configured fraction. `0.0` disables the guard and keeps unconditional market orders.
+
+### Emergency close
+
+If a spot entry fills but the exchange-side protective bracket (stop-loss / take-profit) cannot be placed, the bridge immediately sends an emergency market-sell to close the position. The position is never left unprotected until the next cycle.
+
+### Risk configuration
+
+| Key | Env variable | Default | Meaning |
+|-----|--------------|---------|---------|
+| `risk_max_daily_loss_pct` | `TRADINGAGENTS_RISK_MAX_DAILY_LOSS_PCT` | `5.0` | Maximum allowed daily loss as a percentage of equity |
+| `risk_max_consecutive_loss_count` | `TRADINGAGENTS_RISK_MAX_CONSECUTIVE_LOSS_COUNT` | `3` | Consecutive losing days before a halt is triggered |
+| `risk_max_position_pct_per_asset` | `TRADINGAGENTS_RISK_MAX_POSITION_PCT_PER_ASSET` | `25.0` | Max position size per asset as a percentage of equity |
+| `risk_max_total_exposure_pct` | `TRADINGAGENTS_RISK_MAX_TOTAL_EXPOSURE_PCT` | `80.0` | Max total exposure across all positions |
+| `exec_max_slippage_pct` | `TRADINGAGENTS_EXEC_MAX_SLIPPAGE_PCT` | `0.0` | Max deviation from planned price; `0.0` = disabled |
+| `exec_log_path` | `TRADINGAGENTS_EXEC_LOG_PATH` | `~/.tradingagents/execution/audit.jsonl` | Shared audit log path |
+
+See `tradingagents/default_config.py` for the full list of risk and execution options.
 
 ## Installation and CLI
 

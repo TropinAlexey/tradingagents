@@ -559,6 +559,8 @@ class DerivativesExecutor:
                 confirmed=confirm,
                 order_id=order_id,
                 phase="execute",
+                price_exec=actual_entry,
+                fee=self._bridge._extract_fee(response),
             )
         except OSError as exc:
             raise RuntimeError(

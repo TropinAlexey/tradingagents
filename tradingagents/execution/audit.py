@@ -14,8 +14,20 @@ from typing import Any
 
 
 def append_event(path: str | Path, event: dict[str, Any]) -> None:
-    """Append ``event`` as one JSON line to ``path``, creating parents as needed."""
+    """Append ``event`` as one JSON line to ``path``, creating parents as needed.
+
+    The write is flushed and fsynced before returning so an OS crash or
+    power loss is less likely to leave the audit log with a partial/truncated
+    line that the risk guard would have to treat as corrupt.
+    """
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     with open(target, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        fh.flush()
+        try:
+            import os
+
+            os.fsync(fh.fileno())
+        except OSError:
+            pass

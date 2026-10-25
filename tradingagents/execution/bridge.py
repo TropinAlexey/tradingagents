@@ -425,10 +425,11 @@ class ExchangeBridge:
         The risk guard re-checks immediately before anything is sent (FR-K3):
         a halt on the shared audit log -- including one appended by another
         process after the plan was made -- or a limit breach raises
-        PermissionError on both the dry and live paths. Pass ``portfolio``
-        to re-check the percentage limits too; without it only the
-        denominator-free checks (halt, consecutive losses) run, and the dry
-        path stays fully offline.
+        PermissionError on both the dry and live paths. For live sends
+        ``portfolio`` is required: without a computable equity the percentage
+        limits would be silently skipped at execute time, so the fail-closed
+        re-check refuses the order instead. Dry-run stays fail-open so
+        rehearsal plans without a portfolio are not falsely rejected.
 
         Three refusals raise without an audit line because nothing could ever
         be sent: an order whose signal is not a tradeable 5-tier rating or
@@ -454,11 +455,12 @@ class ExchangeBridge:
                 f"not an executable order: side={order.side!r}, quantity={order.quantity!r}"
             )
         mode = self._effective_mode()
-        # fail_closed=True: a send is being decided, so an unreadable audit
-        # log (locked by a backup/AV scan, permissions) must refuse -- the
-        # halt and loss-streak state it carries cannot be verified.
+        # fail_closed=True only for live sends: a real order about to hit the
+        # wire needs a readable audit log, a computable equity denominator, and
+        # a verified halt state. Dry-run stays fail-open so rehearsal plans
+        # without a portfolio are not falsely rejected.
         decision = self.risk_guard.check(
-            order, portfolio, self.config["exec_log_path"], fail_closed=True
+            order, portfolio, self.config["exec_log_path"], fail_closed=(mode == "live")
         )
         if decision.halted or not decision.allowed:
             self._audit(
@@ -593,6 +595,24 @@ class ExchangeBridge:
                 raise PreTradeRejection(
                     f"cannot verify {order.ccxt_symbol} price at execute time; nothing was sent"
                 )
+            slippage_reason = self._slippage_check(
+                reference=order.estimated_price,
+                current=fresh_price,
+                label="fresh price",
+            )
+            if slippage_reason is not None:
+                self._audit(
+                    action="rejected_at_execute",
+                    order=order,
+                    mode="live",
+                    confirmed=confirm,
+                    qty_precision=amount,
+                    reason=slippage_reason,
+                    phase="execute",
+                )
+                raise PreTradeRejection(
+                    f"{slippage_reason}; nothing was sent"
+                )
             # Decide on the amount that will actually hit the wire: ccxt
             # TRUNCATES the planned quantity to the precision step, so a plan
             # that passed the minimum on the full float can truncate below it.
@@ -622,6 +642,8 @@ class ExchangeBridge:
             self._audit_rejected(order, confirm, f"unexpected error: {exc!r}")
             raise RuntimeError(f"live order on {order.ccxt_symbol} failed: {exc!r}") from exc
 
+        fill_price = self._extract_fill_price(response)
+        fill_fee = self._extract_fee(response)
         try:
             self._audit(
                 action=order.side or "no_order",
@@ -631,6 +653,8 @@ class ExchangeBridge:
                 order_id=order_id,
                 qty_precision=amount,
                 phase="execute",
+                price_exec=fill_price,
+                fee=fill_fee,
             )
         except OSError as exc:
             # The order already exists on the exchange: never let this look
@@ -640,10 +664,12 @@ class ExchangeBridge:
                 f"the audit log failed: {exc}"
             ) from exc
         if order.side == "buy" and (order.stop_loss is not None or order.take_profit is not None):
-            self._place_bracket(order, confirm)
+            self._place_bracket(order, confirm, quantity=float(amount))
         return order_id
 
-    def _place_bracket(self, order: PlannedOrder, confirm: bool) -> None:
+    def _place_bracket(
+        self, order: PlannedOrder, confirm: bool, *, quantity: float
+    ) -> None:
         """Attach exchange-side protective exits after an entry fill.
 
         Binance spot: one OCO order list (``POST /api/v3/orderList/oco``) —
@@ -654,8 +680,8 @@ class ExchangeBridge:
         Verified live on testnet: both legs appear as open orders with the
         entry amount. A bracket that fails to place AFTER the entry filled
         must never discard the fill or look like a failed order (safety #4):
-        it is audited loudly as ``bracket_failed`` and the position stays,
-        protected only by the next daily loop's exit signals.
+        it is audited loudly as ``bracket_failed`` and the position is then
+        closed at market so it is never left unprotected until the next cycle.
         """
         exchange = self._exchange_or_raise()
         market_id = exchange.market_id(order.ccxt_symbol)
@@ -713,6 +739,7 @@ class ExchangeBridge:
                 reason=f"exchange error placing protective exits: {exc}",
                 phase="execute",
             )
+            self._emergency_close_spot(order, confirm, quantity)
             return
         except Exception as exc:  # noqa: BLE001 — the entry already filled
             self._audit(
@@ -723,6 +750,7 @@ class ExchangeBridge:
                 reason=f"unexpected error placing protective exits: {exc!r}",
                 phase="execute",
             )
+            self._emergency_close_spot(order, confirm, quantity)
             return
         bracket_id = response.get("orderListId") if isinstance(response, dict) else None
         try:
@@ -834,6 +862,113 @@ class ExchangeBridge:
         minimum = cost.get("min")
         return float(minimum) if minimum is not None else None
 
+    def _extract_fill_price(self, response: Any) -> float | None:
+        """Best available executed price from a ccxt create_order response."""
+        if not isinstance(response, dict):
+            return None
+        for key in ("average", "price", "last"):
+            value = response.get(key)
+            if isinstance(value, (int, float)):
+                price = float(value)
+                if price > 0:
+                    return price
+        return None
+
+    def _extract_fee(self, response: Any) -> float:
+        """Quote-equivalent fee from a ccxt response, if the venue reports it."""
+        if not isinstance(response, dict):
+            return 0.0
+        quote = str(self.config.get("exec_quote_currency") or "USDT").strip().upper()
+
+        def _fee_value(item: Any) -> float:
+            if not isinstance(item, dict):
+                return 0.0
+            cost = item.get("cost")
+            currency = str(item.get("currency") or "").strip().upper()
+            if cost is None or currency != quote:
+                return 0.0
+            try:
+                return max(float(cost), 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        fee = response.get("fee")
+        if fee is not None:
+            return _fee_value(fee)
+        fees = response.get("fees")
+        if isinstance(fees, list):
+            return sum(_fee_value(item) for item in fees)
+        return 0.0
+
+    def _slippage_check(
+        self,
+        *,
+        reference: float | None,
+        current: float | None,
+        label: str,
+    ) -> str | None:
+        """Return a rejection reason if price moved beyond the slippage cap."""
+        max_slippage_pct = float(self.config.get("exec_max_slippage_pct") or 0.0)
+        if max_slippage_pct <= 0 or reference is None or current is None or reference <= 0:
+            return None
+        deviation = abs(current - reference) / reference
+        if deviation <= max_slippage_pct:
+            return None
+        return (
+            f"{label} {current:.8g} deviates {deviation*100:.2f}% from reference "
+            f"{reference:.8g}, exceeding exec_max_slippage_pct {max_slippage_pct*100:.2f}%"
+        )
+
+    def _emergency_close_spot(
+        self,
+        order: PlannedOrder,
+        confirm: bool,
+        quantity: float,
+    ) -> None:
+        """Market-sell a spot entry whose protective bracket could not be placed.
+
+        The position must not be left unprotected until the next cycle. Any
+        failure here is audited but never raised, because the original entry
+        fill is already a fact on the venue.
+        """
+        import ccxt
+
+        exchange = self._exchange_or_raise()
+        try:
+            amount = exchange.amount_to_precision(order.ccxt_symbol, quantity)
+            response = exchange.create_order(order.ccxt_symbol, "market", "sell", amount)
+            order_id = response.get("id") if isinstance(response, dict) else None
+            self._audit(
+                action="emergency_close",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                order_id=str(order_id) if order_id is not None else None,
+                qty_precision=amount,
+                reason="protective bracket failed; position closed at market",
+                phase="execute",
+                price_exec=self._extract_fill_price(response),
+                fee=self._extract_fee(response),
+            )
+        except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
+            self._audit(
+                action="emergency_close_failed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                reason=f"emergency close failed after bracket failure: {exc}",
+                phase="execute",
+            )
+        except Exception as exc:  # noqa: BLE001 -- the entry already filled
+            self._audit(
+                action="emergency_close_failed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                reason=f"unexpected error during emergency close: {exc!r}",
+                phase="execute",
+            )
+
     def _audit(
         self,
         *,
@@ -845,6 +980,8 @@ class ExchangeBridge:
         qty_precision: str | None = None,
         reason: str | None = None,
         phase: str = "execute",
+        price_exec: float | None = None,
+        fee: float | None = None,
     ) -> None:
         """Write one audit line (FR7). The mode recorded is the effective one.
 
@@ -879,6 +1016,10 @@ class ExchangeBridge:
             event["take_profit"] = order.take_profit
         if qty_precision is not None:
             event["qty_precision"] = qty_precision
+        if price_exec is not None:
+            event["price_exec"] = price_exec
+        if fee is not None:
+            event["fee"] = fee
         if reason is not None:
             # Safety #5: strip any credential that leaked into interpolated
             # exception text before it reaches the audit trail.

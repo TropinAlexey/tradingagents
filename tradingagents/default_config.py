@@ -78,6 +78,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_FIRST_FRACTION": "risk_derivatives_scale_out_first_fraction",
     "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_SECOND_R": "risk_derivatives_scale_out_second_r",
     "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_SECOND_FRACTION": "risk_derivatives_scale_out_second_fraction",
+    "TRADINGAGENTS_EXEC_MAX_SLIPPAGE_PCT":             "exec_max_slippage_pct",
     "TRADINGAGENTS_EXEC_EXCHANGE_ID":                  "exec_exchange_id",
     "TRADINGAGENTS_EXEC_BASE_URL":                     "exec_base_url",
     # Safe mode routes Binance to its Demo Trading API; other exchanges use
@@ -302,6 +303,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # (e.g. {"BTC-USD": "BTC/USDC"}), bypassing the closed crypto set.
     "exec_exchange_id": "binance",
     "exec_symbol_overrides": {},
+    # Maximum allowed deviation between the planned price and the fresh
+    # market price at execute time, as a fraction (0.05 = 5%). 0.0 disables
+    # the slippage guard and keeps unconditional market orders.
+    "exec_max_slippage_pct": 0.0,
     # Explicit Binance venue URL. Demo is the safe default; switching to
     # production is a credentials-and-URL change, independent of live gates.
     "exec_base_url": "https://demo-api.binance.com",

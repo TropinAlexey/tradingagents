@@ -98,7 +98,7 @@ class FakeExchange:
         if self.bracket_error is not None and self._filled >= 1:
             raise self.bracket_error
         self._filled += 1
-        return {"id": "order-123"}
+        return {"id": "order-123", "average": self.price}
 
     def fetch_balance(self):
         self.calls.append(("fetch_balance",))
@@ -360,7 +360,7 @@ def test_live_buy_fill_places_exchange_side_bracket(tmp_path, monkeypatch):
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     order = order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 53_000.0})
-    bridge.execute_order(order, confirm=True)
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())
     oco_calls = [c for c in exchange.calls if c[0] == "orderListOco"]
     assert len(oco_calls) == 1
     request = oco_calls[0][1]
@@ -381,10 +381,51 @@ def test_live_bracket_failure_keeps_the_fill(tmp_path, monkeypatch):
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     order = order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 53_000.0})
-    order_id = bridge.execute_order(order, confirm=True)  # must NOT raise
+    order_id = bridge.execute_order(order, confirm=True, portfolio=buy_book())  # must NOT raise
     assert order_id is not None
     actions = [e["action"] for e in read_audit(tmp_path)]
-    assert actions[-1] == "bracket_failed"
+    assert "buy" in actions
+    assert "bracket_failed" in actions
+
+
+def test_live_bracket_failure_emergency_closes_spot_position(tmp_path, monkeypatch):
+    # When the OCO bracket cannot be placed, the position is market-sold so
+    # it is never left unprotected. FakeExchange raises bracket_error on any
+    # second create_order call, so the emergency close itself fails and is
+    # audited as emergency_close_failed.
+    exchange = FakeExchange(bracket_error=ccxt.ExchangeError("bracket refused"))
+    bridge = live_bridge(tmp_path, monkeypatch, exchange)
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    order = order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 53_000.0})
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())
+    actions = [e["action"] for e in read_audit(tmp_path)]
+    assert "bracket_failed" in actions
+    assert "emergency_close_failed" in actions
+
+
+def test_live_fill_records_execution_price_and_fee(tmp_path, monkeypatch):
+    exchange = FakeExchange()
+    bridge = live_bridge(tmp_path, monkeypatch, exchange)
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())
+    event = read_audit(tmp_path)[-1]
+    assert event["action"] == "buy"
+    assert event["price_exec"] == 50_000.0
+
+
+def test_live_slippage_guard_rejects_before_send(tmp_path, monkeypatch):
+    exchange = FakeExchange(price=55_000.0)
+    bridge = make_bridge(
+        tmp_path, monkeypatch,
+        config={"exec_live": True, "exec_max_slippage_pct": 0.05},
+        factory=lambda: exchange,
+        env={"TRADINGAGENTS_EXEC_LIVE": "true"},
+    )
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    with pytest.raises(RuntimeError, match="slippage"):
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
+    assert not any(call[0] == "create_order" for call in exchange.calls)
+    assert read_audit(tmp_path)[-1]["action"] == "rejected_at_execute"
 
 
 def test_live_without_confirm_is_denied(tmp_path, monkeypatch):
@@ -392,7 +433,7 @@ def test_live_without_confirm_is_denied(tmp_path, monkeypatch):
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     with pytest.raises(PermissionError):
-        bridge.execute_order(order)
+        bridge.execute_order(order, portfolio=buy_book())
     assert not any(call[0] == "create_order" for call in exchange.calls)
     event = read_audit(tmp_path)[-1]
     assert event["action"] == "execute_denied"
@@ -403,7 +444,7 @@ def test_live_with_confirm_places_market_order(tmp_path, monkeypatch):
     exchange = FakeExchange()
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    order_id = bridge.execute_order(order, confirm=True)
+    order_id = bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert order_id == "order-123"
     assert ("create_order", "BTC/USDT", "market", "buy", "0.005000", None) in exchange.calls
     kinds = [call[0] for call in exchange.calls]  # markets must load before precision
@@ -427,7 +468,7 @@ def test_env_flag_is_fail_closed(tmp_path, monkeypatch, value):
         env={"TRADINGAGENTS_EXEC_LIVE": value},
     )
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    bridge.execute_order(order, confirm=True)  # must succeed as a dry run
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())  # must succeed as a dry run
     assert not any(call[0] == "create_order" for call in exchange.calls)
     assert read_audit(tmp_path)[-1]["mode"] == "dry"
 
@@ -442,7 +483,7 @@ def test_env_flag_alone_never_arms_live(tmp_path, monkeypatch):
         env={"TRADINGAGENTS_EXEC_LIVE": "true"},
     )
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    bridge.execute_order(order, confirm=True)
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert not any(call[0] == "create_order" for call in exchange.calls)
     assert read_audit(tmp_path)[-1]["mode"] == "dry"
 
@@ -467,7 +508,7 @@ def test_config_gate_accepts_only_a_real_boolean(tmp_path, monkeypatch, bad):
         env={"TRADINGAGENTS_EXEC_LIVE": "true"},
     )
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    bridge.execute_order(order, confirm=True)
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert not any(call[0] == "create_order" for call in exchange.calls)
 
 
@@ -481,7 +522,7 @@ def test_planned_mode_is_informational_gate_is_decided_at_execute(tmp_path, monk
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     assert order.mode == "dry"
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")  # opened afterwards
-    assert bridge.execute_order(order, confirm=True) == "order-123"
+    assert bridge.execute_order(order, confirm=True, portfolio=buy_book()) == "order-123"
 
 
 def test_live_without_credentials_is_denied(tmp_path, monkeypatch):
@@ -489,7 +530,7 @@ def test_live_without_credentials_is_denied(tmp_path, monkeypatch):
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     with pytest.raises(RuntimeError, match="BINANCE_DEMO_API_KEY"):
-        bridge.execute_order(order, confirm=True)
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert not any(call[0] == "create_order" for call in exchange.calls)
     assert read_audit(tmp_path)[-1]["action"] == "execute_denied"
 
@@ -499,7 +540,7 @@ def test_live_min_cost_drift_rejects_at_execute(tmp_path, monkeypatch):
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     with pytest.raises(RuntimeError, match="minimum"):
-        bridge.execute_order(order, confirm=True)
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert not any(call[0] == "create_order" for call in exchange.calls)
     assert read_audit(tmp_path)[-1]["action"] == "rejected_at_execute"
 
@@ -514,7 +555,7 @@ def test_live_rejects_when_truncated_amount_drops_below_min(tmp_path, monkeypatc
         side="buy", quantity=0.0052399, estimated_price=50_000.0, cost=261.995,
     )
     with pytest.raises(RuntimeError, match="minimum"):
-        bridge.execute_order(order, confirm=True)
+        bridge.execute_order(order, confirm=True, portfolio=PortfolioContext(cash=10_000.0))
     assert not any(call[0] == "create_order" for call in exchange.calls)
     assert read_audit(tmp_path)[-1]["action"] == "rejected_at_execute"
 
@@ -524,7 +565,7 @@ def test_live_exchange_error_is_audited_then_chained(tmp_path, monkeypatch):
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     with pytest.raises(RuntimeError) as excinfo:
-        bridge.execute_order(order, confirm=True)
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert isinstance(excinfo.value.__cause__, ccxt.NetworkError)
     assert read_audit(tmp_path)[-1]["action"] == "rejected_at_execute"
 
@@ -536,7 +577,7 @@ def test_unexpected_error_in_execute_is_audited(tmp_path, monkeypatch):
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     with pytest.raises(RuntimeError) as excinfo:
-        bridge.execute_order(order, confirm=True)
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert isinstance(excinfo.value.__cause__, ValueError)
     event = read_audit(tmp_path)[-1]
     assert event["action"] == "rejected_at_execute"
@@ -552,7 +593,7 @@ def test_foreign_runtime_error_in_execute_is_audited(tmp_path, monkeypatch):
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     with pytest.raises(RuntimeError, match="proxy timeout") as excinfo:
-        bridge.execute_order(order, confirm=True)
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert isinstance(excinfo.value.__cause__, RuntimeError)
     event = read_audit(tmp_path)[-1]
     assert event["action"] == "rejected_at_execute"
@@ -579,7 +620,7 @@ def test_success_audit_failure_reports_order_was_placed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(exchange, "create_order", create_order_and_break_log)
     with pytest.raises(RuntimeError, match="WAS placed") as excinfo:
-        bridge.execute_order(order, confirm=True)
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert "order-123" in str(excinfo.value)
     assert any(call[0] == "create_order" for call in exchange.calls)
 
@@ -669,7 +710,7 @@ def test_custom_factory_client_is_the_one_used(tmp_path, monkeypatch):
     sentinel = FakeExchange()
     bridge = live_bridge(tmp_path, monkeypatch, sentinel)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    bridge.execute_order(order, confirm=True)
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert sentinel.calls  # the injected fake served the live path
 
 
@@ -1013,7 +1054,7 @@ def test_execute_halt_refuses_both_dry_and_live(tmp_path, monkeypatch):
     with pytest.raises(PermissionError, match="halt"):
         bridge.execute_order(order)  # dry path guarded too
     with pytest.raises(PermissionError, match="halt"):
-        bridge.execute_order(order, confirm=True)  # live path guarded too
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())  # live path guarded too
     assert not any(call[0] == "create_order" for call in exchange.calls)
     assert read_audit(tmp_path)[-1]["action"] == "rejected_by_risk"
     assert read_audit(tmp_path)[-1]["phase"] == "execute"
@@ -1050,7 +1091,7 @@ def test_execute_fails_closed_when_audit_log_unreadable(tmp_path, monkeypatch):
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     monkeypatch.setattr(risk_module, "_read_events", lambda path, *, fail_closed=False: None)
     with pytest.raises(PermissionError, match="unreadable"):
-        bridge.execute_order(order, confirm=True)
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
     assert not any(call[0] == "create_order" for call in exchange.calls)
     event = read_audit(tmp_path)[-1]
     assert event["action"] == "rejected_by_risk"
@@ -1253,7 +1294,7 @@ def test_audit_never_contains_credentials_even_in_exchange_errors(tmp_path, monk
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     with pytest.raises(RuntimeError):
-        bridge.execute_order(order, confirm=True)
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
     text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
     assert "sentinel-key-123" not in text
     assert "sentinel-secret-456" not in text
@@ -1266,7 +1307,7 @@ def test_audit_success_flow_never_leaks_credentials(tmp_path, monkeypatch):
     monkeypatch.setenv("BINANCE_API_KEY", "sentinel-key-123")
     monkeypatch.setenv("BINANCE_SECRET", "sentinel-secret-456")
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    bridge.execute_order(order, confirm=True)
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())
     text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
     assert "sentinel-key-123" not in text
     assert "sentinel-secret-456" not in text

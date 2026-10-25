@@ -84,13 +84,15 @@ def test_halt_is_sticky_across_checks_and_reset_clears_it(tmp_path, monkeypatch)
     assert decision.allowed is True
 
 
-def test_halt_expires_when_the_utc_day_rolls_over(tmp_path, monkeypatch):
+def test_halt_persists_until_reset_not_day_rollover(tmp_path, monkeypatch):
     freeze(monkeypatch, FROZEN_NOW)
     audit = tmp_path / "audit.jsonl"
     write_events(audit, [{"event": "halt", "timestamp": ts(), "reason": "streak"}])
     g = guard()
     assert g.check(plan(), PortfolioContext(cash=1_000.0), audit).halted is True
-    freeze(monkeypatch, TOMORROW)  # next UTC day: the halt self-expires
+    freeze(monkeypatch, TOMORROW)  # next UTC day: the halt must NOT self-expire
+    assert g.check(plan(), PortfolioContext(cash=1_000.0), audit).halted is True
+    g.reset_halt(audit)
     assert g.check(plan(), PortfolioContext(cash=1_000.0), audit).halted is False
 
 
@@ -176,8 +178,8 @@ def test_daily_loss_breach_after_reset_can_halt_again(tmp_path, monkeypatch):
     assert len(halts) == 2
 
 
-def test_breach_halt_expires_the_next_utc_day(tmp_path, monkeypatch):
-    # (c) a guard-appended breach halt self-expires when the UTC day rolls.
+def test_breach_halt_persists_until_reset(tmp_path, monkeypatch):
+    # A guard-appended breach halt must NOT self-expire when the UTC day rolls.
     freeze(monkeypatch, FROZEN_NOW)
     audit = tmp_path / "audit.jsonl"
     write_events(audit, [
@@ -191,6 +193,9 @@ def test_breach_halt_expires_the_next_utc_day(tmp_path, monkeypatch):
     g = guard()
     assert g.check(plan(), PortfolioContext(cash=1_000.0), audit).halted is True
     freeze(monkeypatch, TOMORROW)
+    decision = g.check(plan(), PortfolioContext(cash=1_000.0), audit)
+    assert decision.halted is True
+    g.reset_halt(audit)
     decision = g.check(plan(), PortfolioContext(cash=1_000.0), audit)
     assert decision.halted is False
     assert decision.allowed is True
@@ -306,15 +311,15 @@ def test_unrealized_pnl_on_lots_opened_today_is_marked_via_price_of(tmp_path, mo
     assert "daily loss" in decision.reason
 
 
-def test_lots_opened_before_today_are_not_marked_into_daily_pnl(tmp_path, monkeypatch):
+def test_lots_opened_before_today_are_marked_into_daily_pnl(tmp_path, monkeypatch):
     freeze(monkeypatch, FROZEN_NOW)
     audit = tmp_path / "audit.jsonl"
     yesterday = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
     write_events(audit, [event("buy", 2.0, 100.0, day=yesterday, hour=8)])
-    # the open lot predates today: even a big mark-down today is not "today's loss"
+    # the open lot's unrealized loss is today's risk, no matter when it opened
     decision = guard(prices={"BTC-USD": 10.0}).check(plan(), PortfolioContext(cash=1_000.0), audit)
-    assert decision.halted is False
-    assert decision.allowed is True
+    assert decision.halted is True
+    assert "daily loss" in decision.reason
 
 
 # --- short P&L (derivatives lines carry market="derivatives") -----------------
@@ -726,4 +731,65 @@ def test_missing_log_is_a_fresh_log_even_when_failing_closed(tmp_path):
     decision = guard().check(
         plan(), PortfolioContext(cash=1_000.0), tmp_path / "missing.jsonl", fail_closed=True
     )
+    assert decision.allowed is True
+
+
+# --- execution price and fees ---------------------------------------------
+
+
+def test_realized_pnl_uses_execution_price_not_estimate(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # buy at estimate 100, sell at exec 70: realized -60 on equity 1000 = 6%
+    write_events(audit, [
+        event("buy", 2.0, 100.0, hour=8),
+        {**event("sell", 2.0, 150.0, hour=9), "price_exec": 70.0},
+    ])
+    decision = guard().check(plan(), PortfolioContext(cash=1_000.0), audit)
+    assert decision.halted is True
+    assert "daily loss" in decision.reason
+
+
+def test_fees_reduce_realized_pnl_and_can_trigger_halt(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # buy 2@100, sell 2@97: gross PnL -6, fees 45 -> net -51 = 5.1% > 5%
+    write_events(audit, [
+        event("buy", 2.0, 100.0, hour=8),
+        {**event("sell", 2.0, 97.0, hour=9), "fee": 45.0},
+    ])
+    decision = guard().check(plan(), PortfolioContext(cash=1_000.0), audit)
+    assert decision.halted is True
+    assert "daily loss" in decision.reason
+
+
+# --- fail-closed equity at execute time ------------------------------------
+
+
+def test_execute_time_recheck_refuses_without_portfolio(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    decision = guard().check(plan(), None, audit, fail_closed=True)
+    assert decision.allowed is False
+    assert "portfolio required" in decision.reason
+
+
+# --- corrupt audit lines ---------------------------------------------------
+
+
+def test_corrupt_lines_fail_closed_at_execute_time(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text("not json\n", encoding="utf-8")
+    decision = guard().check(plan(), PortfolioContext(cash=1_000.0), audit, fail_closed=True)
+    assert decision.allowed is False
+    assert "unreadable" in decision.reason
+
+
+def test_halt_without_timestamp_is_ignored(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    write_events(audit, [{"event": "halt"}])
+    decision = guard().check(plan(), PortfolioContext(cash=1_000.0), audit)
+    assert decision.halted is False
     assert decision.allowed is True

@@ -1,6 +1,6 @@
 ---
 purpose: Project rules for AI agents
-updated: 2026-09-28
+updated: 2026-10-25
 source: generated-by-zcode-starterkit
 ---
 
@@ -110,6 +110,19 @@ Before finalizing any coding pass, scan the structure of every file the diff tou
 - Vendor/data-vendor chains (`data_vendors` config) fall through in order; keep the fallback chain contract when touching dataflows.
 - The CLI entry is `cli/main.py` (Typer); user-facing state lives under `~/.tradingagents/` (logs, cache, memory log, checkpoints) — never write run state into the repo.
 - `results/` is generated output, excluded from ruff; don't edit or commit it.
+
+## Execution Risk Management
+
+The execution bridge and risk guard share a single append-only `audit.jsonl` under `exec_log_path` (default `~/.tradingagents/execution/audit.jsonl`). Treat it as the cross-process source of truth for halt state, P&L replay, and consecutive-loss counting.
+
+- **Halts are sticky.** A `halt` event blocks every subsequent order until a matching `halt_reset` event is appended or `reset_halt()` is called. Halts do **not** self-expire at UTC midnight. Use `_halted(events)` (not `_halted_today`) when reading state; `server/audit.py` and `server/portfolio.py` were migrated to `_halted`.
+- **Daily loss includes unrealized P&L.** `_daily_pnl` counts realized P&L from today's closed trades plus unrealized P&L on **all** open lots, marked to the current price. Only realized trades at or before the forgiveness point (latest halt/halt_reset) are excluded.
+- **P&L uses execution price and fees.** Fills must record `price_exec` and `fee` in the audit event. `_replay` matches lots FIFO and subtracts pro-rata fees from realized P&L.
+- **Fail-closed at execute time.** `RiskGuard.check(..., fail_closed=True)` (used for live sends in `bridge.py`) refuses the order when the audit log is unreadable, contains corrupt lines, equity is not computable, or a halt is active. Plan-time checks remain fail-open so rehearsals without a portfolio are not falsely rejected.
+- **Slippage guard.** `exec_max_slippage_pct` rejects a market order when the fresh price deviates from the planned price by more than the configured fraction. `0.0` disables the guard.
+- **Emergency close.** If a spot buy fills but the exchange-side stop-loss/take-profit bracket cannot be placed, `bridge.py` immediately market-sells the position. Never leave a spot entry unprotected.
+- **Audit durability.** `append_event` flushes and fsyncs the audit log before returning.
+- **Env overrides.** New execution/risk config keys must be added to `_ENV_OVERRIDES` in `tradingagents/default_config.py` to be overridable from the environment.
 
 ## Boundaries / Gotchas
 
