@@ -250,7 +250,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # armed as a literal True in code, never via env â€” and the
     # TRADINGAGENTS_EXEC_LIVE env flag, re-read at execute time, fail-closed.
     # Keeping the halves independent means no single switch arms live trading.
-    "exec_live": False,
+    "exec_live": True,
     "exec_log_path": os.getenv("TRADINGAGENTS_EXEC_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "execution", "audit.jsonl"),
     "exec_quote_currency": "USDT",
     # Futures mode: linear contracts settled in these assets may be screened
@@ -314,6 +314,6 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # TRADINGAGENTS_EXEC_DERIVATIVES are read fail-closed at call time, so no
     # single switch can arm automatic or derivatives trading. Derivatives
     # additionally requires per-order confirm=True even in dry-run.
-    "exec_auto_confirm": False,
-    "exec_derivatives": False,
+    "exec_auto_confirm": True,
+    "exec_derivatives": True,
 })
