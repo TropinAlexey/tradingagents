@@ -153,7 +153,7 @@ Sidebar trái có 6 mục (`web/components/sidebar.tsx:15-22`). Thanh **Mode bar
 
 ### 3.0 Mode bar SANDBOX / LIVE
 
-`LIVE`/`SANDBOX` là trạng thái **quyền gửi lệnh**, không phải lựa chọn venue. Binance venue được chọn bằng `TRADINGAGENTS_EXEC_BASE_URL`: Demo là mặc định, production cần URL production cùng credentials production. Demo vẫn là lệnh live trên tài khoản Demo khi các gate LIVE mở; nó không phải paper/dry-run.
+`LIVE`/`SANDBOX` là trạng thái **quyền gửi lệnh**, không phải lựa chọn venue. Binance venue được chọn bằng `PUT /api/venue` (Demo mặc định); production cần URL production cùng credentials production. Demo vẫn là lệnh live trên tài khoản Demo khi các gate LIVE mở; nó không phải paper/dry-run.
 
 Đọc `GET /api/settings` mỗi 30 giây (`web/components/mode-bar.tsx:22`). Bốn trạng thái:
 
@@ -164,7 +164,7 @@ Sidebar trái có 6 mục (`web/components/sidebar.tsx:15-22`). Thanh **Mode bar
 | ĐANG TẢI CHẾ ĐỘ… | Request đầu tiên chưa trả về. |
 | KHÔNG KẾT NỐI (viền vàng) + nút "Thử lại" | Không đọc được `/api/settings` — backend có thể chưa chạy (xem §4.1). |
 
-> `SANDBOX` trên mode bar không chọn Binance Demo. Binance venue được xác định bởi URL read-only trong Settings; `exec_sandbox` chỉ điều khiển sandbox của các sàn khác. Với cài mới, `exec_live=False` nên bấm Duyệt trả 412.
+> `SANDBOX` trên mode bar không chọn Binance Demo. Binance venue được chọn ở card Venue (`PUT /api/venue`), không phải URL read-only trong Settings; `exec_sandbox` chỉ điều khiển sandbox của các sàn khác. Với cài mới, `exec_live=False` nên bấm Duyệt trả 412.
 
 Vì sao LIVE phải hiển thị rõ ràng như vậy: duyệt lệnh LIVE là hành động không thể
 hoàn tác và mất tiền thật. LIVE chỉ bật khi **cả hai nửa cổng FR5** cùng mở —
@@ -433,7 +433,7 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
   - Đây là cơ chế khóa lợi nhuận có điều kiện, không phải bảo đảm lợi nhuận: gap, slippage,
     liquidation, mất mạng/API hoặc venue outage vẫn có thể khiến fill khác mức stop.
   - Lưu ý: giá trị mới chỉ áp cho guard/monitor được dựng sau khi lưu (`types.ts:120`).
-- **Thực thi & Sàn** — `exec_exchange_id`, `exec_quote_currency`, URL Binance read-only (`exec_base_url`) và `exec_sandbox` cho các sàn khác. Binance mặc định Demo; URL + credential pair quyết định Demo/production.
+- **Thực thi & Sàn** — `exec_exchange_id`, `exec_quote_currency`, URL Binance read-only (`exec_base_url`, đổi qua card Venue) và `exec_sandbox` cho các sàn khác. Binance mặc định Demo; URL + credential pair quyết định Demo/production.
 
 **Các thẻ chỉ-đọc:**
 - *Khóa API* — trạng thái key (mục §2.2); không sửa được từ UI.

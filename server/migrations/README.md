@@ -9,11 +9,13 @@ checksum, and serializes runs with a PostgreSQL advisory lock inside its
 transaction. Migration files contain schema DDL only; do not add a separate
 ledger row or explicit transaction wrapper.
 
-The runner is not wired to application startup. The server continues to use its
-existing SQLite/JSONL runtime stores; this artifact does not switch any read or
-write path and does not dual-write. Applying this schema is not a production
-cutover or permission to enable execution. Any future store cutover requires a
-separately reviewed deployment/backfill plan and tested repository adapters.
+The runner IS wired to application startup: `server/main.py:_open_state_db()`
+calls `postgres.migrate()` before the API serves a request, and the control
+plane has no SQLite fallback (`server/db.py`). PostgreSQL holds jobs, runs,
+approvals, settings, the watchlist and durable position state. The execution
+audit log (`exec_log_path`) stays JSONL because it is the cross-process replay
+contract for RiskGuard, not control-plane state. Applying this schema is not
+permission to enable execution: the execution gates remain independent.
 
 ## Ledger invariants
 
@@ -21,9 +23,7 @@ separately reviewed deployment/backfill plan and tested repository adapters.
   decisions, approvals, orders, fills, context links, and position snapshots.
 - Parent deletion does not cascade into analysis or financial history.
 - One job result is permitted per `(workspace, job, instrument, attempt)`. A
-  retry is a new attempt; this is a target-schema rule, not a statement about
-  existing SQLite/JSONL history. Reconcile retry/update semantics before any
-  import or backfill.
+  retry is a new attempt and gets a new attempt number.
 - Approval references, when present, must identify a result/run or a
   decision/run/instrument tuple consistently. `claim_approval` is a conditional
   update and yields a row to at most one concurrent worker.
@@ -41,8 +41,8 @@ separately reviewed deployment/backfill plan and tested repository adapters.
 
 ## Integration verification
 
-Run `.venv/Scripts/python.exe -m pytest -q tests/test_postgres_migrations_integration.py`.
-The test starts a PostgreSQL 16 service using the isolated
-`tests/postgres-compose.yml` project, then removes only its uniquely named Compose
-project and volume. It skips when Docker Engine is unavailable. It does not
-connect the API runtime to PostgreSQL.
+Run `.venv/bin/python -m pytest -q tests/test_postgres_migrations_integration.py`
+(`.venv\Scripts\python.exe` on Windows). The test starts a PostgreSQL 16 service
+using the isolated `tests/postgres-compose.yml` project, then removes only its
+uniquely named Compose project and volume. It skips when Docker Engine is
+unavailable.

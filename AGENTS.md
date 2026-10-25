@@ -171,3 +171,73 @@ def _apply_env_overrides(config: dict) -> dict:
   - Local wiki (vault `C:\Users\mrc\Documents\projects\agent-wiki`): `queries/coding-standards-cross-language-cookbook.md` (Structural rules / Escalation covenant / Shared rules), `queries/coding-standards-programming-languages-cookbook.md`, `queries/coding-standards-programming-languages-python-cookbook.md`. Reopen via the `obsidian` skill (`read_note` / `search_notes`).
   - Bundled catalog: `agent-skills-standard` pinned commit `9f695e8e2c3e423dfcd420a0e6b80e0e99044088` (snapshot 2026-08-01, Apache-2.0) — packs listed under Selected Guideline Packs.
 - **Open questions:** none blocking; `/review-codebase` can deepen subsystem notes.
+
+## Research / investigation log
+
+### 2026-10-25 — test fixes, two-axis review, and demo-cycle preparation
+
+**Goal:** bring the repo to a green state after PR #12, perform a Standards + Spec review of all uncommitted/committed changes since `1b77064`, fix every review finding, then run dry and demo trading cycles.
+
+**Fixes applied**
+- Reverted shipped execution gates (`exec_live`, `exec_auto_confirm`, `exec_derivatives`) to `False` to keep the default fail-closed contract.
+- `tradingagents/execution/bridge.py`:
+  - `_binance_profile` made public; `_extract_fee` now converts base-asset fees to quote using the fill price.
+  - Emergency close uses the actual held quantity (`bracket_qty`), not the planned quantity.
+  - Added public `venue_key` / `bridge_venue_key` helpers.
+  - Extended `audit_plan` signature with `price_exec` and `fee`.
+- `tradingagents/execution/derivatives.py`: added fresh-price slippage guard on the live futures path before `create_order`.
+- `server/autoloop.py`: futures universe now returns `[]` when production volume ranking fails (fail-closed) instead of falling back to synthetic demo volumes.
+- `server/venue.py` (new), `server/control_store.py`, `server/main.py`: venue switch API wired; error code for invalid venue changed from `422` to `400`.
+- `server/operator_config.py` + callers: exposed `ALLOWED_KEYS`; replaced private `_ALLOWED` imports.
+- `tradingagents/execution/futures_account.py`: replaced silent `except: pass` with logged `Exception` catch.
+- Unified duplicated `_venue_key` copies across `brackets.py`, `futures_protection.py`, `futures_adoption.py`.
+- Updated `tradingagents/dataflows/screening.py` to use public `binance_profile`.
+- Docs updated: `docs/ui-api-contract.md` §16 venue API, `docs/operator-guide.md` venue switch procedure, `server/migrations/README.md` PostgreSQL wiring.
+- Added/updated tests for fee conversion, emergency-close quantity, derivatives slippage, and futures-universe fail-closed behavior.
+
+**Verification**
+```bash
+.venv/bin/python -m ruff check .                              # clean
+TRADINGAGENTS_TEST_DATABASE_URL=postgresql://... .venv/bin/python -m pytest -q
+# 1636 passed, 2 skipped, 91 subtests passed
+```
+
+**Dry test cycle (deterministic stub graph)**
+- Started disposable PostgreSQL from `tests/postgres-compose.yml`.
+- Ran `autoloop._run_cycle()` with a stub graph returning `Buy`, `exec_auto_confirm=True`, `exec_live=False`, temporary audit log.
+- Result: `BTC-USD executed=True side=buy qty≈0.015486 price_est≈80719.06 mode=dry`.
+- Audit contained plan + execute lines with stop-loss/take-profit; reason `dry-run: order not sent to exchange`.
+
+**Full demo-cycle preparation**
+- Verified `.env` provides `BINANCE_DEMO_API_KEY`, `BINANCE_DEMO_SECRET`, `OPENROUTER_API_KEY`, and `TRADINGAGENTS_LLM_PROVIDER=openrouter`.
+- Default LLM models: `quick_think_llm = nvidia/nemotron-3-ultra-550b-a55b:free`, `deep_think_llm = anthropic/claude-sonnet-5.5`.
+- To keep the demo run bounded, the script caps `AUTO_UNIVERSE_PER_ASSET=5` and `AUTO_SCREEN_POOL=3` in-process only.
+- Required env flags for live demo execution: `TRADINGAGENTS_EXEC_LIVE=true` and `TRADINGAGENTS_EXEC_AUTO_CONFIRM=true`.
+- Config literals armed via `PUT /api/operator-config`: `exec_live=true`, `exec_auto_confirm=true`; `exec_derivatives=false` (spot demo only).
+
+**Spot demo-cycle result (Binance Demo Trading + OpenRouter LLM)**
+- Started disposable PostgreSQL, migrated, then launched the control-plane server via `TestClient` with live env flags.
+- Capped universe in-process to `AUTO_UNIVERSE_PER_ASSET=3` / `AUTO_SCREEN_POOL=1` to keep the run bounded.
+- Initial `PUT /api/operator-config` without `confirm=true` returned `412 gate_confirmation_required`; retry with `confirm=true` + `reason` succeeded.
+- `POST /api/autoloop/run-now` returned `202 started`.
+- The cycle completed in ~10 minutes. The only screened candidate was `ETH-USD`; the real agent graph returned `Underweight`.
+- Because the demo spot portfolio had no ETH position, the planner refused the order:
+  - Audit: `ETH-USD signal=Underweight action=no_order reason="no position to close/reduce" price_est=2356.02 mode=dry`.
+  - No order was sent to Binance Demo; no bracket was placed.
+- Telemetry showed `graph_analysis` took ~613 s (real LLM calls via OpenRouter), `portfolio_sync` ~6 s, planning <1 s.
+- Universe fetched: 3 crypto, 3 stock.
+
+**Futures demo-cycle result (Binance Demo Futures + OpenRouter LLM)**
+- Same setup, but armed all three gates: `exec_live=true`, `exec_auto_confirm=true`, `exec_derivatives=true`; env flags `TRADINGAGENTS_EXEC_LIVE=true`, `TRADINGAGENTS_EXEC_AUTO_CONFIRM=true`, `TRADINGAGENTS_EXEC_DERIVATIVES=true`.
+- Venue confirmed demo; demo futures credentials present.
+- `POST /api/autoloop/run-now` returned `202 started`.
+- The cycle completed in ~4 minutes. Futures universe fetched 40 crypto contracts (settle assets `USDC`, `USDT`); screened candidate was `XMR-USD`.
+- The real agent graph returned `Hold` with reason `agent_abstained`.
+- Audit was empty; no futures order was sent to Binance Demo.
+- Telemetry showed `graph_analysis` took ~206 s; several `OpenAIRateLimitError` occurred and were handled by falling back to report-only free text.
+- **Post-run fix:** futures universe construction was changed from "most liquid contract per base asset" to "most liquid contract per settle asset held in the futures wallet, with no duplicate base assets". The screen score is now overridden to preserve this liquidity/settle order. This means a wallet holding both `USDT` and `USDC` will now analyze up to two distinct candidates (e.g. `BTC-USDT` and `SOL-USDC`) instead of a single momentum winner.
+
+**System launcher**
+- Added `start.sh` (macOS/Linux equivalent of `start.bat`).
+- It checks `.venv/bin/python`, installs `web/node_modules` if missing, starts `uvicorn server.main:app` on port 8000, starts `npm run dev` in `web/` on port 3000, polls `/api/health`, then opens `http://localhost:3000`.
+- Logs are written to `backend.log` and `frontend.log`; PIDs to `backend.pid` / `frontend.pid`.
