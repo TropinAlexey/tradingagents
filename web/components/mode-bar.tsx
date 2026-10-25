@@ -9,6 +9,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { cn } from "cn";
 import { useT } from "@/lib/i18n";
+import { VenueSwitch } from "@/components/venue-switch";
+import { useVenue } from "@/lib/venue";
 
 type ModeState =
   | { status: "loading" }
@@ -28,6 +30,9 @@ export function ModeBar() {
   const [state, setState] = useState<ModeState>({ status: "loading" });
   const t = useT();
   const copy = t.common.modeBar;
+  const venueCopy = t.common.venue;
+  const venue = useVenue();
+  const production = venue.data?.venue === "production";
 
   // Hàm thuần: chỉ fetch và trả về trạng thái mới, không đụng setState.
   const fetchMode = useCallback(async (): Promise<ModeState> => {
@@ -56,6 +61,21 @@ export function ModeBar() {
   const tone = (() => {
     switch (state.status) {
       case "ready":
+        if (production) {
+          return state.live
+            ? {
+                bar: "border-b-red-700 bg-red-600 text-white",
+                icon: <TriangleAlertIcon className="size-5 shrink-0" aria-hidden="true" />,
+                title: venueCopy.realMoneyTitle,
+                subtitle: venueCopy.realMoneySubtitle,
+              }
+            : {
+                bar: "border-b-amber-500 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-100",
+                icon: <TriangleAlertIcon className="size-5 shrink-0" aria-hidden="true" />,
+                title: venueCopy.productionDryTitle,
+                subtitle: venueCopy.productionDrySubtitle,
+              };
+        }
         return state.live
           ? {
               bar: "border-b-red-600 bg-red-50 text-red-900 dark:bg-red-950 dark:text-red-100",
@@ -115,6 +135,7 @@ export function ModeBar() {
         <p className="text-sm font-bold tracking-wide">{tone.title}</p>
         <p className="truncate text-xs">{tone.subtitle}</p>
       </div>
+      <VenueSwitch state={venue} compact />
       {state.status === "error" && (
         <Button
           variant="outline"

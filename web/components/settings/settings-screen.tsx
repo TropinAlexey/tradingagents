@@ -23,6 +23,7 @@ import { SettingsSection } from "./settings-section";
 import { groupRows } from "./types";
 import { useSettings } from "./use-settings";
 import { InterfacePreferencesCard } from "./interface-preferences-card";
+import { VenueCard } from "./venue-card";
 import { useT } from "@/lib/i18n";
 
 function SettingsSkeleton() {
@@ -31,6 +32,7 @@ function SettingsSkeleton() {
     <div aria-busy="true" aria-live="polite">
       <PageHeader page="settings" description={t.settings.screen.loadingDescription} />
       <InterfacePreferencesCard />
+      <VenueCard />
       <div className="space-y-4">
         {[0, 1, 2].map((card) => (
           <div key={card} className="rounded-xl bg-card p-4 ring-1 ring-foreground/10">
@@ -65,6 +67,7 @@ export function SettingsScreen() {
       <div>
         <PageHeader page="settings" description={c.errorDescription} />
         <InterfacePreferencesCard />
+        <VenueCard />
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -93,6 +96,7 @@ export function SettingsScreen() {
     <div>
       <PageHeader page="settings" />
       <InterfacePreferencesCard />
+      <VenueCard />
       <div className="mb-4 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
         <span>{c.updatedAt(formatDateTimeVi(payload.generated_at))}</span>
         {controller.isStale ? (
