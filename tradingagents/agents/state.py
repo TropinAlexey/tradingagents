@@ -75,3 +75,7 @@ class AgentState(MessagesState):
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
     past_context: Annotated[str, "Memory log context injected at run start (same-ticker decisions + cross-ticker lessons)"]
     portfolio_context: Annotated[str, "Caller-supplied holdings and cash, rendered at run start; empty when not provided"]
+    execution_context: Annotated[str, "Current venue/account and market facts provided to execution decision agents"]
+    futures_execution_proposal: Annotated[dict, "Final Portfolio Manager futures execution proposal, when one is supported"]
+    futures_execution_intent: Annotated[str, "Final futures intent: enter, manage_existing, or abstain"]
+    futures_execution_status: Annotated[str, "Futures structured-output status for diagnostics"]

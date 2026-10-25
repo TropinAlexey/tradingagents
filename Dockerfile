@@ -8,7 +8,9 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /build
 COPY . .
-RUN pip install --no-cache-dir .
+# The control panel is a web service: FastAPI/uvicorn and the PostgreSQL
+# driver come from the `web` extra, so one image serves the API.
+RUN pip install --no-cache-dir ".[web]"
 
 FROM python:3.12-slim
 
@@ -25,4 +27,8 @@ WORKDIR /home/appuser/app
 
 COPY --from=builder --chown=appuser:appuser /build .
 
-ENTRYPOINT ["tradingagents"]
+EXPOSE 8000
+
+# PostgreSQL is mandatory: the app fails fast when TRADINGAGENTS_DATABASE_URL
+# is missing rather than silently persisting SQLite state.
+ENTRYPOINT ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
