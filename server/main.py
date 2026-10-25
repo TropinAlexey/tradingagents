@@ -40,6 +40,7 @@ from server import (
     postgres,
     runs,
     settings,
+    venue,
     watchlist,
 )
 from server.contract import error_response, install_error_handlers
@@ -71,11 +72,11 @@ def _apply_operator_config() -> None:
     Only the allowlisted keys in ``server/operator_config.py`` are applied; a
     stored row for an unknown key is ignored rather than injected into config.
     """
-    from server.operator_config import _ALLOWED
+    from server.operator_config import ALLOWED_KEYS
     from tradingagents.dataflows.config import set_config
 
     stored = control_store.load_operator_settings()
-    applied = {key: value for key, value in stored.items() if key in _ALLOWED}
+    applied = {key: value for key, value in stored.items() if key in ALLOWED_KEYS}
     if applied:
         set_config(applied)
         logger.info("applied %d operator override(s) from PostgreSQL", len(applied))
@@ -106,6 +107,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # to exist before they can be read back into the process config.
     _open_state_db()
     _apply_operator_config()
+    venue.apply_stored_venue()  # the UI venue choice wins over the .env default
     watchlist.ensure_seeded()
     with suppress(OSError):  # unreadable data dir must not keep the server down; the loop stays off
         autoloop.ensure_started()
@@ -156,5 +158,6 @@ for _router in (
     health.router,
     performance.router,
     autoloop.router,
+    venue.router,
 ):
     app.include_router(_router)

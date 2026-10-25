@@ -126,18 +126,18 @@ def import_operator_config(source_dir: Path, *, dry_run: bool) -> int:
     """Legacy ``operator_config.json`` -> ``control_operator_settings``.
 
     Keys outside the allowlist are reported and skipped: the old file accepted
-    any key, while the table only stores what ``operator_config._ALLOWED``
+    any key, while the table only stores what ````operator_config.ALLOWED_KEYS``
     declares, so an unknown key must not silently become live config.
     """
-    from server.operator_config import _ALLOWED
+    from server.operator_config import ALLOWED_KEYS
 
     data = _read_json(source_dir / "operator_config.json")
     if not isinstance(data, dict) or not data:
         print("skip: operator_config: no overrides")
         return 0
 
-    accepted = {key: value for key, value in data.items() if key in _ALLOWED}
-    rejected = sorted(key for key in data if key not in _ALLOWED)
+    accepted = {key: value for key, value in data.items() if key in ALLOWED_KEYS}
+    rejected = sorted(key for key in data if key not in ALLOWED_KEYS)
     if rejected:
         print(f"skip: operator_config: keys outside the allowlist {rejected}")
 

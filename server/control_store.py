@@ -114,6 +114,24 @@ def save_autoloop_state(state: dict) -> None:
         )
 
 
+def load_setting(key: str) -> dict:
+    """One ``control_settings`` payload by key ({} when unset)."""
+    with db.read() as conn:
+        row = conn.execute(
+            "SELECT payload FROM control_settings WHERE key = %s", (key,)
+        ).fetchone()
+    return row["payload"] if row is not None else {}
+
+
+def save_setting(key: str, payload: dict) -> None:
+    with db.session() as conn:
+        conn.execute(
+            "INSERT INTO control_settings (key, payload) VALUES (%s, %s::jsonb) "
+            "ON CONFLICT (key) DO UPDATE SET payload = excluded.payload",
+            (key, _json(payload)),
+        )
+
+
 # --- server action trail ---------------------------------------------------
 
 
