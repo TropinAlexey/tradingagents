@@ -37,7 +37,7 @@ from tradingagents.agents.rating import RATINGS_5_TIER, is_review
 from tradingagents.dataflows.symbols import futures_base
 from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.brackets import BracketManager
-from tradingagents.execution.bridge import ExchangeBridge
+from tradingagents.execution.bridge import ExchangeBridge, PreTradeRejection
 from tradingagents.execution.futures_safety import (
     FuturesPlanError,
     risk_limited_quantity,
@@ -510,8 +510,31 @@ class DerivativesExecutor:
             # real leverage.
             exchange.set_leverage(int(order.leverage), order.ccxt_symbol)
             amount = exchange.amount_to_precision(order.ccxt_symbol, order.quantity)
+            fresh_price = self._bridge._fetch_price(order.ccxt_symbol)
+            if fresh_price is None:
+                self._bridge.audit_plan(
+                    order, action="rejected_at_execute",
+                    reason="fresh price unavailable at execute",
+                    confirmed=confirm, phase="execute",
+                )
+                raise PreTradeRejection(
+                    f"cannot verify {order.ccxt_symbol} price at execute time; nothing was sent"
+                )
+            slippage_reason = self._bridge._slippage_check(
+                reference=order.estimated_price,
+                current=fresh_price,
+                label="fresh futures price",
+            )
+            if slippage_reason is not None:
+                self._bridge.audit_plan(
+                    order, action="rejected_at_execute",
+                    reason=slippage_reason, confirmed=confirm, phase="execute",
+                )
+                raise PreTradeRejection(f"{slippage_reason}; nothing was sent")
             response = exchange.create_order(order.ccxt_symbol, "market", order.side, amount)
             order_id = response.get("id") if isinstance(response, dict) else None
+        except PreTradeRejection:
+            raise  # already audited above
         except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
             self._bridge.audit_plan(
                 order, action="rejected_at_execute",
@@ -560,7 +583,9 @@ class DerivativesExecutor:
                 order_id=order_id,
                 phase="execute",
                 price_exec=actual_entry,
-                fee=self._bridge._extract_fee(response),
+                fee=self._bridge._extract_fee(
+                    response, symbol=order.ccxt_symbol, price=actual_entry
+                ),
             )
         except OSError as exc:
             raise RuntimeError(

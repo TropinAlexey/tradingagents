@@ -62,7 +62,7 @@ _BINANCE_DEMO_HOSTS = frozenset({"demo-api.binance.com", "demo-fapi.binance.com"
 _BINANCE_PRODUCTION_HOSTS = frozenset({"api.binance.com", "fapi.binance.com"})
 
 
-def _binance_profile(base_url: str | None) -> str:
+def binance_profile(base_url: str | None) -> str:
     """Validate the configured Binance base URL and return its profile."""
     raw = str(base_url or "").strip()
     parsed = urlparse(raw)
@@ -78,10 +78,35 @@ def _binance_profile(base_url: str | None) -> str:
     )
 
 
+def venue_key(exchange_id: str, base_url: str | None, sandbox: bool) -> str:
+    """Stable identity of the account behind a venue configuration.
+
+    Callers persist this key with position/bracket state so a later process
+    trading a DIFFERENT venue never adopts or mutates the earlier venue's
+    positions. Quote currency is deliberately excluded: one account holds
+    every settle asset.
+    """
+    return "|".join((
+        str(exchange_id).lower(),
+        str(base_url or "").rstrip("/").lower(),
+        str(sandbox is True),
+    ))
+
+
+def bridge_venue_key(bridge: Any) -> str:
+    """``venue_key`` for an ``ExchangeBridge``-shaped object."""
+    config = bridge.config
+    return venue_key(
+        bridge.exchange_id,
+        config.get("exec_base_url"),
+        config.get("exec_sandbox"),
+    )
+
+
 def credential_env_names(exchange_id: str, base_url: str | None = None) -> tuple[str, str]:
     """Return credential env vars coupled to the selected venue profile."""
     upper = exchange_id.strip().upper()
-    if upper == "BINANCE" and _binance_profile(base_url or "https://api.binance.com") == "demo":
+    if upper == "BINANCE" and binance_profile(base_url or "https://api.binance.com") == "demo":
         return "BINANCE_DEMO_API_KEY", "BINANCE_DEMO_SECRET"
     return f"{upper}_API_KEY", f"{upper}_SECRET"
 
@@ -126,7 +151,7 @@ def _default_exchange_factory(
         )
     profile = None
     if exchange_id == "binance":
-        profile = _binance_profile(base_url or "https://demo-api.binance.com")
+        profile = binance_profile(base_url or "https://demo-api.binance.com")
     credential_url = base_url or (
         "https://demo-api.binance.com" if profile == "demo" else "https://api.binance.com"
     ) if exchange_id == "binance" else None
@@ -643,7 +668,7 @@ class ExchangeBridge:
             raise RuntimeError(f"live order on {order.ccxt_symbol} failed: {exc!r}") from exc
 
         fill_price = self._extract_fill_price(response)
-        fill_fee = self._extract_fee(response)
+        fill_fee = self._extract_fee(response, symbol=order.ccxt_symbol, price=fill_price)
         try:
             self._audit(
                 action=order.side or "no_order",
@@ -739,7 +764,7 @@ class ExchangeBridge:
                 reason=f"exchange error placing protective exits: {exc}",
                 phase="execute",
             )
-            self._emergency_close_spot(order, confirm, quantity)
+            self._emergency_close_spot(order, confirm, float(bracket_qty))
             return
         except Exception as exc:  # noqa: BLE001 — the entry already filled
             self._audit(
@@ -750,7 +775,7 @@ class ExchangeBridge:
                 reason=f"unexpected error placing protective exits: {exc!r}",
                 phase="execute",
             )
-            self._emergency_close_spot(order, confirm, quantity)
+            self._emergency_close_spot(order, confirm, float(bracket_qty))
             return
         bracket_id = response.get("orderListId") if isinstance(response, dict) else None
         try:
@@ -794,6 +819,8 @@ class ExchangeBridge:
         confirmed: bool = False,
         order_id: str | None = None,
         phase: str = "plan",
+        price_exec: float | None = None,
+        fee: float | None = None,
     ) -> None:
         """Public audit writer for orchestrators (e.g. the daily runner and
         the derivatives executor).
@@ -809,6 +836,8 @@ class ExchangeBridge:
             order_id=order_id,
             reason=reason,
             phase=phase,
+            price_exec=price_exec,
+            fee=fee,
         )
 
     def fetch_price(self, ticker: str) -> float | None:
@@ -874,23 +903,40 @@ class ExchangeBridge:
                     return price
         return None
 
-    def _extract_fee(self, response: Any) -> float:
-        """Quote-equivalent fee from a ccxt response, if the venue reports it."""
+    def _extract_fee(
+        self,
+        response: Any,
+        *,
+        symbol: str | None = None,
+        price: float | None = None,
+    ) -> float:
+        """Quote-equivalent fee from a ccxt response, if the venue reports it.
+
+        Spot market buys are charged in the received base asset, so the raw
+        ``cost`` is converted with the executed price; a fee in any other
+        currency (e.g. BNB) cannot be priced here and is reported as 0.
+        """
         if not isinstance(response, dict):
             return 0.0
         quote = str(self.config.get("exec_quote_currency") or "USDT").strip().upper()
+        base = str(symbol or "").split("/", 1)[0].strip().upper()
 
         def _fee_value(item: Any) -> float:
             if not isinstance(item, dict):
                 return 0.0
             cost = item.get("cost")
             currency = str(item.get("currency") or "").strip().upper()
-            if cost is None or currency != quote:
+            if cost is None:
                 return 0.0
             try:
-                return max(float(cost), 0.0)
+                amount = max(float(cost), 0.0)
             except (TypeError, ValueError):
                 return 0.0
+            if currency == quote:
+                return amount
+            if currency == base and price is not None and price > 0:
+                return amount * float(price)
+            return 0.0
 
         fee = response.get("fee")
         if fee is not None:
@@ -948,7 +994,11 @@ class ExchangeBridge:
                 reason="protective bracket failed; position closed at market",
                 phase="execute",
                 price_exec=self._extract_fill_price(response),
-                fee=self._extract_fee(response),
+                fee=self._extract_fee(
+                    response,
+                    symbol=order.ccxt_symbol,
+                    price=self._extract_fill_price(response),
+                ),
             )
         except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
             self._audit(

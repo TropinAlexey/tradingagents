@@ -283,6 +283,7 @@ def test_lifespan_starts_and_stops_monitor_with_other_lifecycle_hooks(monkeypatc
     calls = []
     monkeypatch.setattr(main, "_apply_operator_config", lambda: calls.append("config"))
     monkeypatch.setattr(main, "_open_state_db", lambda: calls.append("database"))
+    monkeypatch.setattr(main.venue, "apply_stored_venue", lambda: calls.append("venue"))
     monkeypatch.setattr(main.watchlist, "ensure_seeded", lambda: calls.append("watchlist"))
     monkeypatch.setattr(main.autoloop, "ensure_started", lambda: calls.append("autoloop"))
     monkeypatch.setattr(main.bracket_monitor, "start", lambda: calls.append("bracket-monitor-start"))
@@ -308,6 +309,7 @@ def test_lifespan_starts_and_stops_monitor_with_other_lifecycle_hooks(monkeypatc
         # table must exist before the config is applied.
         "database",
         "config",
+        "venue",
         "watchlist",
         "autoloop",
         "bracket-monitor-start",

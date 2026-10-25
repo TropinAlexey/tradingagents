@@ -8,6 +8,7 @@ from typing import Any
 
 from server import job_store
 from tradingagents.execution.brackets import BracketManager
+from tradingagents.execution.bridge import bridge_venue_key
 from tradingagents.execution.futures_account import FuturesPosition, read_futures_positions
 from tradingagents.execution.profit_protection import evaluate_profit_protection
 
@@ -111,7 +112,7 @@ def _manage_one(
         if len(candidates) != 1:
             return {"position_key": position_key, "status": "missing_bracket_link"}
         candidate = candidates[0]
-        if candidate.get("venue_key") and candidate["venue_key"] != _venue_key(bridge):
+        if candidate.get("venue_key") and candidate["venue_key"] != bridge_venue_key(bridge):
             return {"position_key": position_key, "status": "venue_mismatch"}
         state = {**state, "bracket_task_id": candidate["task_id"], "venue_key": candidate.get("venue_key")}
         if not job_store.save_position_state(position_key, state["revision"], state):
@@ -162,7 +163,7 @@ def _manage_one_with_lease(
     task = job_store.load_bracket_recovery(bracket_task_id)
     if task is None:
         return {"position_key": position_key, "status": "missing_bracket_task"}
-    if task.get("venue_key") and task["venue_key"] != _venue_key(bridge):
+    if task.get("venue_key") and task["venue_key"] != bridge_venue_key(bridge):
         return {"position_key": position_key, "status": "venue_mismatch"}
     stop_leg = next((leg for leg in task["legs"] if leg["name"] == "stop-loss"), None)
     target_legs = [leg for leg in task["legs"] if leg["name"].startswith("take-profit")]
@@ -287,15 +288,6 @@ def _validate_policy_config(config: dict) -> None:
     max_mark_age = float(config.get("risk_derivatives_mark_max_age_seconds", 120.0))
     if not math.isfinite(max_mark_age) or max_mark_age <= 0:
         raise ValueError("mark maximum age must be finite and positive")
-
-
-def _venue_key(bridge: Any) -> str:
-    config = bridge.config
-    return "|".join((
-        str(bridge.exchange_id).lower(),
-        str(config.get("exec_base_url") or "").rstrip("/").lower(),
-        str(config.get("exec_sandbox") is True),
-    ))
 
 
 def _position_map(positions: tuple[FuturesPosition, ...]) -> dict[tuple[str, str], FuturesPosition]:

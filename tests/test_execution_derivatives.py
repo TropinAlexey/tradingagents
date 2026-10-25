@@ -1383,3 +1383,24 @@ def test_exports_expose_the_executor():
     import tradingagents.execution as execution_package
 
     assert execution_package.DerivativesExecutor is DerivativesExecutor
+
+
+def test_live_execute_rejects_when_fresh_price_moved_past_slippage(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange(price=55_000.0)
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(
+            risk_max_derivatives_exposure_pct=100.0,
+            exec_max_slippage_pct=0.02,
+        ),
+        factory=lambda: exchange, env=live_env(),
+    )
+    book = PortfolioContext(cash=1_000.0)
+    order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
+
+    with pytest.raises(RuntimeError, match="slippage"):
+        executor.execute_order(order, confirm=True, portfolio=book)
+
+    assert not [call for call in exchange.calls if call[0] == "create_order"]
+    assert read_audit(tmp_path)[-1]["action"] == "rejected_at_execute"
+    assert "slippage" in read_audit(tmp_path)[-1]["reason"]

@@ -109,8 +109,8 @@ def _normalize_position(raw: Any, client: Any) -> FuturesPosition | None:
             value = market_for(raw["symbol"])
             if isinstance(value, dict):
                 market = value
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - metadata only; never hide the position
+            logger.debug("futures market metadata unavailable for %s: %r", raw.get("symbol"), exc)
     quote_currency = market.get("quote")
     settlement_currency = info.get("marginAsset") or info.get("ccy") or market.get("settle")
     contract_size = _number(market.get("contractSize")) or 1.0
@@ -357,8 +357,9 @@ def read_futures_account(bridge, settle: str | None = None) -> FuturesAccountSna
 
     Venue-specific params keep CCXT on derivatives endpoints while preserving
     the venue's current client configuration. ``settle`` (e.g. "USDC") scopes
-    a Binance single-asset-mode account to that asset's margin book; without
-    it, or in multi-assets mode, the account totals are used.
+    a Binance single-asset-mode account to that asset's margin book when it
+    differs from ``exec_quote_currency``; otherwise, and in multi-assets mode,
+    the account totals are used.
     """
     client = bridge.client()
     exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
@@ -370,8 +371,12 @@ def read_futures_account(bridge, settle: str | None = None) -> FuturesAccountSna
         raise ValueError("exchange returned an invalid futures account response")
     normalized = read_futures_positions(bridge)
     values = None
-    if settle and exchange_id == "binance" and not _binance_multi_assets(client):
-        values = _binance_settle_values(balance, settle.strip().upper())
+    settle = settle.strip().upper() if settle else None
+    quote = str(bridge.config.get("exec_quote_currency") or "USDT").strip().upper()
+    # The account totals already are the quote asset's book in single-asset
+    # mode; only another settle asset (USDC) needs its own row.
+    if settle and settle != quote and exchange_id == "binance" and not _binance_multi_assets(client):
+        values = _binance_settle_values(balance, settle)
         if values is None:
             raise ValueError(f"futures wallet has no {settle} balance row")
     if values is None:

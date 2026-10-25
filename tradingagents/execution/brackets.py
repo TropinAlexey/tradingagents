@@ -11,6 +11,7 @@ from typing import Any
 import ccxt
 
 from server import job_store
+from tradingagents.execution.bridge import bridge_venue_key
 from tradingagents.execution.sizing import PlannedOrder
 
 _TASK_LOCK = threading.RLock()
@@ -18,15 +19,6 @@ _TERMINAL_STATUSES = {
     "emergency_closed", "reconciled_take_profit",
     "reconciled_stop_loss", "cancelled", "completed",
 }
-
-
-def _venue_key(bridge: Any) -> str:
-    config = bridge.config
-    return "|".join((
-        str(bridge.exchange_id).lower(),
-        str(config.get("exec_base_url") or "").rstrip("/").lower(),
-        str(config.get("exec_sandbox") is True),
-    ))
 
 
 def _info(item: dict) -> dict:
@@ -186,14 +178,14 @@ class BracketManager:
             job_store.create_bracket_recovery(
                 task_id, symbol=order.ccxt_symbol, entry_order_id=entry_order_id or "unknown",
                 close_side=close_side, quantity=float(order.quantity), legs=legs,
-                now=datetime.now(timezone.utc).isoformat(), venue_key=_venue_key(self.bridge),
+                now=datetime.now(timezone.utc).isoformat(), venue_key=bridge_venue_key(self.bridge),
             )
             task = job_store.load_bracket_recovery(task_id)
             position_key = f"{order.ccxt_symbol}:{order.side}:{entry_order_id or 'unknown'}"
             position_state = job_store.load_position_state(position_key)
             if position_state is not None and position_state.get("bracket_task_id") != task_id:
                 position_state["bracket_task_id"] = task_id
-                position_state["venue_key"] = _venue_key(self.bridge)
+                position_state["venue_key"] = bridge_venue_key(self.bridge)
                 job_store.save_position_state(
                     position_key, position_state["revision"], position_state,
                 )
@@ -246,7 +238,7 @@ class BracketManager:
                 raise KeyError(task_id)
             if task["status"] in _TERMINAL_STATUSES:
                 return task["status"]
-            if task.get("venue_key") and task["venue_key"] != _venue_key(self.bridge):
+            if task.get("venue_key") and task["venue_key"] != bridge_venue_key(self.bridge):
                 self._save(task, task["status"], "configured venue/profile does not match the venue that placed this bracket")
                 return "venue_mismatch"
             exchange = self.bridge.client()
@@ -310,7 +302,7 @@ class BracketManager:
             task = job_store.load_bracket_recovery(task_id)
             if task is None:
                 raise KeyError(task_id)
-            if task.get("venue_key") and task["venue_key"] != _venue_key(self.bridge):
+            if task.get("venue_key") and task["venue_key"] != bridge_venue_key(self.bridge):
                 self._save(task, task["status"], "configured venue/profile does not match the venue that placed this bracket")
                 return "venue_mismatch"
             leg = next((item for item in task["legs"] if item["name"] == leg_name), None)
@@ -392,7 +384,7 @@ class BracketManager:
             task = job_store.load_bracket_recovery(task_id)
             if task is None:
                 raise KeyError(task_id)
-            if task.get("venue_key") and task["venue_key"] != _venue_key(self.bridge):
+            if task.get("venue_key") and task["venue_key"] != bridge_venue_key(self.bridge):
                 self._save(task, task["status"], "configured venue/profile does not match the venue that placed this bracket")
                 return "venue_mismatch"
             exchange = self.bridge.client()

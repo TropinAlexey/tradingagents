@@ -1417,3 +1417,50 @@ def test_derivatives_gates_closed_plan_order_never_touches_the_exchange(tmp_path
             stop_loss=48_000.0, take_profit=55_000.0,
         )
     assert exchange.calls == []  # not even load_markets: the refusal precedes resolution
+
+
+def test_live_base_asset_fee_is_converted_to_quote(tmp_path, monkeypatch):
+    class BaseFeeExchange(FakeExchange):
+        def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+            self.calls.append(("create_order", symbol, order_type, side, amount, params))
+            self._filled += 1
+            return {
+                "id": "order-fee",
+                "average": self.price,
+                "fee": {"cost": 0.00001, "currency": "BTC"},
+            }
+
+    bridge = live_bridge(tmp_path, monkeypatch, BaseFeeExchange())
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())
+    event = read_audit(tmp_path)[-1]
+    assert event["fee"] == pytest.approx(0.5)
+
+
+def test_emergency_close_uses_the_held_quantity_not_the_plan(tmp_path, monkeypatch):
+    class PartialHoldExchange(FakeExchange):
+        def fetch_balance(self):
+            return {
+                "total": {"BTC": 0.004, "USDT": 1_000.0},
+                "free": {"BTC": 0.004, "USDT": 1_000.0},
+            }
+
+        def privatePostOrderListOco(self, request):
+            self.calls.append(("orderListOco", request))
+            raise ccxt.ExchangeError("bracket refused")
+
+        def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+            self.calls.append(("create_order", symbol, order_type, side, amount, params))
+            if side == "buy":
+                self._filled += 1
+                return {"id": "entry", "average": self.price}
+            return {"id": "close", "average": self.price}
+
+    exchange = PartialHoldExchange()
+    bridge = live_bridge(tmp_path, monkeypatch, exchange)
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    order = order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 53_000.0})
+    bridge.execute_order(order, confirm=True, portfolio=buy_book())
+    closes = [c for c in exchange.calls if c[0] == "create_order" and c[3] == "sell"]
+    assert len(closes) == 1
+    assert float(closes[0][4]) == pytest.approx(0.004)
