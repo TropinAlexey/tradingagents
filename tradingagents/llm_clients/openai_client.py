@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -316,7 +316,7 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
 class MinimaxChatOpenAI(NormalizedChatOpenAI):
     """MiniMax-specific overrides on top of the OpenAI-compatible client.
 
-    M2.x reasoning models embed ``<think>...</think>`` blocks directly in
+    M2.x reasoning models embed ``thinking...thinking`` blocks directly in
     ``message.content`` by default, which would pollute saved reports.
     Per platform.minimax.io/docs/api-reference/text-openai-api,
     ``reasoning_split=True`` redirects the thinking block into
@@ -344,6 +344,48 @@ class MinimaxChatOpenAI(NormalizedChatOpenAI):
             extra_body = payload.setdefault("extra_body", {})
             extra_body.setdefault("reasoning_split", True)
         return payload
+
+
+# Settings a ChatGPT plan refuses.
+_PLAN_REFUSED = ("temperature", "top_p", "max_tokens")
+
+
+class ChatGPTPlanChatOpenAI(NormalizedChatOpenAI):
+    """The person's ChatGPT plan through OpenAI's Responses API.
+
+    Plan usage accepts no stored responses and no ``system`` role, and refuses
+    sampling and length settings. Responses stream and are not stored; system
+    instructions are sent as ``developer`` messages, OpenAI's name for the same
+    role; refused settings are dropped with a warning; no API organization or
+    project is sent.
+    """
+
+    def __init__(self, **kwargs):
+        for name in _PLAN_REFUSED:
+            if kwargs.pop(name, None) is not None:
+                logger.warning("A ChatGPT plan does not accept %s; it is not sent.", name)
+        kwargs.setdefault("streaming", True)
+        kwargs.setdefault("store", False)
+        super().__init__(**kwargs)
+        # The sign-in names the account; an organization or project set for API
+        # keys (OPENAI_ORG_ID, OPENAI_PROJECT_ID) must not travel with it.
+        self.openai_organization = None
+        for client in (self.root_client, self.root_async_client):
+            client.organization = None
+            client.project = None
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        for item in payload.get("input") or []:
+            if isinstance(item, dict) and item.get("role") == "system":
+                item["role"] = "developer"
+        return payload
+
+
+def _chatgpt_credential() -> Callable[[], str]:
+    from .chatgpt_auth import credential
+
+    return credential()
 
 
 # Kwargs forwarded from user config to ChatOpenAI
@@ -392,6 +434,11 @@ class ProviderSpec:
     placeholder_key: str = "EMPTY"            # sent when no key is available (keyless local servers)
     require_base_url: bool = False            # error if no base_url is resolved (generic endpoint)
     use_responses_api: bool = False           # native OpenAI Responses API
+    # A provider the user signs in to: ``credential()`` returns the api_key callable
+    # (a fresh token per request) or raises when nobody is signed in. Its token goes
+    # only to its pinned base_url, and never alongside an API key.
+    credential: Callable[[], Callable[[], str]] | None = None
+    pinned_base_url: bool = False             # refuse any other endpoint for this provider
 
 
 # Single source of truth for the OpenAI-compatible provider family. Dual-region
@@ -415,6 +462,10 @@ OPENAI_COMPATIBLE_PROVIDERS: dict[str, ProviderSpec] = {
     "ollama":     ProviderSpec(base_url="http://localhost:11434/v1", base_url_env="OLLAMA_BASE_URL",
                                key_optional=True, placeholder_key="ollama",
                                chat_class=LocalCompatibleChatOpenAI),
+    # The person's ChatGPT plan, through their own sign-in.
+    "chatgpt":    ProviderSpec(base_url="https://api.openai.com/v1", chat_class=ChatGPTPlanChatOpenAI,
+                               use_responses_api=True, credential=_chatgpt_credential,
+                               pinned_base_url=True),
     # Generic endpoint: user supplies base_url; key optional (keyless local).
     "openai_compatible": ProviderSpec(
         require_base_url=True, key_optional=True, chat_class=LocalCompatibleChatOpenAI
@@ -477,6 +528,12 @@ class OpenAIClient(BaseLLMClient):
             # OLLAMA_BASE_URL) > provider default. None means use the SDK default.
             env_base_url = os.environ.get(spec.base_url_env) if spec.base_url_env else None
             base_url = self.base_url or env_base_url or spec.base_url
+
+            # Pinned base_url: if the provider is signed-in (e.g. chatgpt), refuse
+            # any other endpoint and use the pinned one.
+            if spec.pinned_base_url and spec.base_url:
+                base_url = spec.base_url
+
             if spec.require_base_url and not base_url:
                 raise ValueError(
                     f"Provider '{self.provider}' requires a base_url. Set it via "
@@ -489,18 +546,23 @@ class OpenAIClient(BaseLLMClient):
 
             # API key: required unless key_optional; keyless local servers get a
             # placeholder. The env-var name is the single source in api_key_env.
-            api_key_env = get_api_key_env(self.provider)
-            api_key = os.environ.get(api_key_env) if api_key_env else None
-            if api_key:
-                llm_kwargs["api_key"] = api_key
-            elif spec.key_optional:
-                llm_kwargs["api_key"] = spec.placeholder_key
-            elif api_key_env:
-                raise ValueError(
-                    f"API key for provider '{self.provider}' is not set. "
-                    f"Please set the {api_key_env} environment variable "
-                    f"(e.g. add {api_key_env}=your_key to your .env file)."
-                )
+            # For signed-in providers (chatgpt), the credential callable provides the
+            # token and no static key is used.
+            if spec.credential is not None:
+                llm_kwargs["api_key"] = spec.credential()
+            else:
+                api_key_env = get_api_key_env(self.provider)
+                api_key = os.environ.get(api_key_env) if api_key_env else None
+                if api_key:
+                    llm_kwargs["api_key"] = api_key
+                elif spec.key_optional:
+                    llm_kwargs["api_key"] = spec.placeholder_key
+                elif api_key_env:
+                    raise ValueError(
+                        f"API key for provider '{self.provider}' is not set. "
+                        f"Please set the {api_key_env} environment variable "
+                        f"(e.g. add {api_key_env}=your_key to your .env file)."
+                    )
 
             # The Responses API only exists on native OpenAI; if the user points
             # the openai provider at a custom base_url (proxy/gateway/local), it
