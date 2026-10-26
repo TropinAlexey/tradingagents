@@ -4,6 +4,7 @@ from typing import Any
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from .base_client import BaseLLMClient, normalize_content
+from .fallback import create_fallback_chain
 from .validators import validate_model
 
 _GEMINI_VERSION = re.compile(r"^gemini-(\d+)\.(\d+)")
@@ -65,7 +66,20 @@ class GoogleClient(BaseLLMClient):
                 thinking_level = "low"
             llm_kwargs["thinking_level"] = thinking_level
 
-        return NormalizedChatGoogleGenerativeAI(**llm_kwargs)
+        # Build the primary model
+        primary_model = NormalizedChatGoogleGenerativeAI(**llm_kwargs)
+
+        # Handle fallback models (provider-agnostic client-side fallback)
+        fallback_names = self.kwargs.get("fallback_model_names") or []
+        if fallback_names:
+            def make_fallback(model_name: str):
+                fallback_kwargs = dict(llm_kwargs)
+                fallback_kwargs["model"] = model_name
+                return NormalizedChatGoogleGenerativeAI(**fallback_kwargs)
+
+            return create_fallback_chain(primary_model, make_fallback, fallback_names)
+
+        return primary_model
 
     def validate_model(self) -> bool:
         """Validate model for Google."""

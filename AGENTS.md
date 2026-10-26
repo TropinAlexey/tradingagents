@@ -227,7 +227,7 @@ TRADINGAGENTS_TEST_DATABASE_URL=postgresql://... .venv/bin/python -m pytest -q
 - Telemetry showed `graph_analysis` took ~613 s (real LLM calls via OpenRouter), `portfolio_sync` ~6 s, planning <1 s.
 - Universe fetched: 3 crypto, 3 stock.
 
-**Futures demo-cycle result (Binance Demo Futures + OpenRouter LLM)**
+**Futures demo-cycle result #1 (Binance Demo Futures + OpenRouter LLM)**
 - Same setup, but armed all three gates: `exec_live=true`, `exec_auto_confirm=true`, `exec_derivatives=true`; env flags `TRADINGAGENTS_EXEC_LIVE=true`, `TRADINGAGENTS_EXEC_AUTO_CONFIRM=true`, `TRADINGAGENTS_EXEC_DERIVATIVES=true`.
 - Venue confirmed demo; demo futures credentials present.
 - `POST /api/autoloop/run-now` returned `202 started`.
@@ -236,6 +236,16 @@ TRADINGAGENTS_TEST_DATABASE_URL=postgresql://... .venv/bin/python -m pytest -q
 - Audit was empty; no futures order was sent to Binance Demo.
 - Telemetry showed `graph_analysis` took ~206 s; several `OpenAIRateLimitError` occurred and were handled by falling back to report-only free text.
 - **Post-run fix:** futures universe construction was changed from "most liquid contract per base asset" to "most liquid contract per settle asset held in the futures wallet, with no duplicate base assets". The screen score is now overridden to preserve this liquidity/settle order. This means a wallet holding both `USDT` and `USDC` will now analyze up to two distinct candidates (e.g. `BTC-USDT` and `SOL-USDC`) instead of a single momentum winner.
+
+**Futures demo-cycle result #2 (`AUTO_SCREEN_POOL=3`, Binance Demo Futures + OpenRouter LLM)**
+- Same gate/venue setup as result #1, but `autoloop.AUTO_SCREEN_POOL = 3` was set in-process to allow more than one candidate through the screen.
+- `POST /api/autoloop/run-now` returned `202 started`; cycle completed in ~21 minutes (`06:57:24Z` → `07:18:03Z`).
+- Per-settle universe produced two candidates: `BTC-USD` (USDT-settled) and `ETH-USD` (USDT-settled). Both were analyzed by the real agent graph.
+- Both candidates returned `Underweight`:
+  - `BTC-USD`: `executed=false`, `reason="confirmation_missing"` (1h/4h candle direction did not confirm the bearish short signal).
+  - `ETH-USD`: `executed=false`, `reason="agent_proposal_rejected: non-market entry_price is unsupported by autoloop"`.
+- Audit was empty; no futures order was sent to Binance Demo.
+- Telemetry showed the two graph analyses took ~14 minutes and ~4 minutes respectively; several `OpenAIRateLimitError` occurred and were handled by falling back to report-only free text.
 
 **System launcher**
 - Added `start.sh` (macOS/Linux equivalent of `start.bat`).

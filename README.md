@@ -108,6 +108,43 @@ Our framework decomposes complex trading tasks into specialized roles.
   <img src="assets/risk.png" width="70%" style="display: inline-block; margin: 0 2%;">
 </p>
 
+### Phase 1: Core Reliability (v0.6.0+)
+
+TradingAgents v0.6.0 introduces Phase 1 hardening across the entire pipeline:
+
+#### Provider-Agnostic LLM Fallback Chains
+- **Cross-provider fallbacks** — any provider (OpenRouter, NVIDIA, Anthropic, Google, xAI, DeepSeek, etc.) can have fallback models via `TRADINGAGENTS_QUICK_FALLBACK_BY_PROVIDER` / `TRADINGAGENTS_DEEP_FALLBACK_BY_PROVIDER`
+- **OpenRouter native fallback** — uses `models` array in single request (no extra round-trips), capped at 3
+- **Client-side fallback** — sequential retry on 429/capacity/unavailable errors for all other providers
+- **Per-tier configuration** — quick tier (analysts/trader/risk) and deep tier (managers) can use different providers with independent fallback chains
+
+#### Crypto-Native Data Layer
+- **ccxt OHLCV vendor** — Binance + Bybit support for spot/futures (`tradingagents/dataflows/vendors/ccxt/ohlcv.py`)
+- **Auto-routing** — crypto symbols (`BTC-USD`, `ETH-USD`, `SOL-USD` + 100+) automatically route to ccxt
+- **Multi-venue fallback** — vendor chain: `ccxt(binance),ccxt(bybit),yfinance`
+- **Point-in-time validation** — dual stale check: day-level (backtest) + minute-level (live runs, 30 min max staleness)
+- **Configurable exchange** — `ccxt_exchange` (binance/bybit), `ccxt_market_type` (spot/futures)
+
+#### Configuration via Environment
+```bash
+# Quick tier (analysts/trader/risk)
+TRADINGAGENTS_QUICK_PROVIDER=openrouter
+TRADINGAGENTS_QUICK_THINK_LLM=anthropic/claude-sonnet-5
+TRADINGAGENTS_QUICK_FALLBACK_BY_PROVIDER={"openrouter": "google/gemini-3.8-flash,deepseek/deepseek-chat,xai/grok-4.6", "nvidia": "google/gemma-4-26b-it,google/gemma-4-12b-it"}
+
+# Deep tier (managers)
+TRADINGAGENTS_DEEP_PROVIDER=openrouter
+TRADINGAGENTS_DEEP_THINK_LLM=anthropic/claude-opus-5-5
+TRADINGAGENTS_DEEP_FALLBACK_BY_PROVIDER={"openrouter": "anthropic/claude-fable-5-1,google/gemini-3.1-pro-preview,xai/grok-4.6", "nvidia": "google/gemma-4-26b-it"}
+
+# Crypto data
+TRADINGAGENTS_CORE_STOCK_APIS="ccxt(binance),ccxt(bybit),yfinance"
+TRADINGAGENTS_CCXT_EXCHANGE=binance
+TRADINGAGENTS_CCXT_MARKET_TYPE=spot
+```
+
+---
+
 ## Risk Management
 
 TradingAgents ships execution-time risk controls that live next to the exchange bridge and use a shared, append-only `audit.jsonl` as their source of truth. The checks run when a plan is created and again immediately before any order is sent, so a halt appended by another process, the web API, or a human operator always blocks the next live trade.

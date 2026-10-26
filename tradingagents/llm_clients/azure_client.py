@@ -4,6 +4,7 @@ from typing import Any
 from langchain_openai import AzureChatOpenAI
 
 from .base_client import BaseLLMClient, normalize_content
+from .fallback import create_fallback_chain
 
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "api_key", "reasoning_effort", "temperature",
@@ -44,7 +45,21 @@ class AzureOpenAIClient(BaseLLMClient):
             if key in self.kwargs:
                 llm_kwargs[key] = self.kwargs[key]
 
-        return NormalizedAzureChatOpenAI(**llm_kwargs)
+        # Build the primary model
+        primary_model = NormalizedAzureChatOpenAI(**llm_kwargs)
+
+        # Handle fallback models (provider-agnostic client-side fallback)
+        fallback_names = self.kwargs.get("fallback_model_names") or []
+        if fallback_names:
+            def make_fallback(model_name: str):
+                fallback_kwargs = dict(llm_kwargs)
+                fallback_kwargs["model"] = model_name
+                fallback_kwargs["azure_deployment"] = os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME", model_name)
+                return NormalizedAzureChatOpenAI(**fallback_kwargs)
+
+            return create_fallback_chain(primary_model, make_fallback, fallback_names)
+
+        return primary_model
 
     def validate_model(self) -> bool:
         """Azure accepts any deployed model name."""

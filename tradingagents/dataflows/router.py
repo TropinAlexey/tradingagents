@@ -17,6 +17,7 @@ from tradingagents.dataflows.vendors.alpha_vantage import (
     get_news as get_alpha_vantage_news,
     get_stock as get_alpha_vantage_stock,
 )
+from tradingagents.dataflows.vendors.ccxt.ohlcv import load_ohlcv as get_ccxt_ohlcv
 from tradingagents.dataflows.vendors.fred import get_macro_data as get_fred_macro_data
 from tradingagents.dataflows.vendors.polymarket import (
     get_prediction_markets as get_polymarket_prediction_markets,
@@ -41,6 +42,26 @@ from tradingagents.dataflows.vendors.yahoo.news import get_global_news_yfinance,
 from tradingagents.diagnostics import diagnostic_span
 
 logger = logging.getLogger(__name__)
+
+# Known crypto base assets that should route to ccxt
+CRYPTO_BASES = frozenset({
+    "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "DOT", "MATIC",
+    "LINK", "UNI", "LTC", "BCH", "XLM", "VET", "FIL", "TRX", "ETC", "ATOM",
+    "NEAR", "ALGO", "ICP", "HBAR", "THETA", "AAVE", "MKR", "COMP", "SNX",
+    "YFI", "SUSHI", "CRV", "1INCH", "BAL", "REN", "KNC", "ZRX", "BAT",
+    "MANA", "SAND", "AXS", "ENJ", "CHZ", "GRT", "ANKR", "BAND", "OCEAN",
+    "STORJ", "LPT", "NU", "KEEP", "RLC", "CVC", "DNT", "MLN", "REP",
+    "ZEC", "DASH", "XMR", "ZEN", "BEAM", "GRIN", "FIRO", "XVG", "NAV",
+    "PIVX", "SYS", "RDD", "POT", "PEPE", "SHIB", "FLOKI", "BONK",
+    "WIF", "POPCAT", "MEW", "MYRO", "BOME", "SLERF", "WEN", "SAMO",
+})
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    """Check if symbol is a known crypto (e.g., BTC-USD, ETH-USD)."""
+    if not isinstance(symbol, str):
+        return False
+    base = symbol.split("-")[0].upper()
+    return base in CRYPTO_BASES
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -108,6 +129,8 @@ VENDOR_METHODS = {
     "get_stock_data": {
         "alpha_vantage": get_alpha_vantage_stock,
         "yfinance": get_YFin_data_online,
+        "ccxt(binance)": lambda symbol, start_date, end_date: get_ccxt_ohlcv(symbol, start_date, end_date, exchange_id="binance", market_type="spot"),
+        "ccxt(bybit)": lambda symbol, start_date, end_date: get_ccxt_ohlcv(symbol, start_date, end_date, exchange_id="bybit", market_type="spot"),
     },
     # technical_indicators
     "get_indicators": {
@@ -208,6 +231,14 @@ def route_to_vendor(method: str, *args, **kwargs):
             )
     else:
         vendor_chain = all_available_vendors
+
+    # For crypto symbols, prefer ccxt exchanges if available in the chain
+    if method == "get_stock_data" and args:
+        symbol = str(args[0])
+        if _is_crypto_symbol(symbol):
+            ccxt_vendors = [v for v in vendor_chain if v.startswith("ccxt(")]
+            other_vendors = [v for v in vendor_chain if not v.startswith("ccxt(")]
+            vendor_chain = ccxt_vendors + other_vendors
 
     last_no_data: NoMarketDataError | None = None
     last_unavailable: VendorRateLimitError | None = None

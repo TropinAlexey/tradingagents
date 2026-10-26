@@ -60,11 +60,21 @@ def _tier_llm_settings(config: dict, tier: str) -> tuple[str, str | None]:
     return str(provider).lower(), base_url
 
 
-def _fallback_models(config: dict, tier: str) -> list[str]:
-    """The tier's OpenRouter fallback chain from a comma-separated config value."""
-    raw = config.get(f"{tier}_fallback_models") or ""
-    items = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
-    return [item.strip() for item in items if str(item).strip()]
+def _fallback_models(config: dict, tier: str, provider: str | None = None) -> list[str]:
+    """Resolve fallback chain for a tier, optionally for a specific provider.
+
+    Priority:
+    1. Provider-specific override (from {tier}_fallback_by_provider config)
+    2. Tier-level fallback (from {tier}_fallback_models config)
+
+    Works for ANY provider: OpenRouter uses native API; others use client-side retry.
+    """
+    from tradingagents.llm_clients.fallback import _get_provider_fallbacks
+
+    tier_fallbacks = config.get(f"{tier}_fallback_models")
+    provider_fallbacks = config.get(f"{tier}_fallback_by_provider")
+    provider = (provider or config.get("llm_provider", "")).lower()
+    return _get_provider_fallbacks(tier_fallbacks, provider_fallbacks, provider)
 
 
 class TradingAgentsGraph:
@@ -107,9 +117,9 @@ class TradingAgentsGraph:
             ("deep", deep_provider, deep_kwargs),
             ("quick", quick_provider, quick_kwargs),
         ):
-            fallbacks = _fallback_models(self.config, tier)
-            if provider == "openrouter" and fallbacks:
-                kwargs["fallback_models"] = fallbacks
+            fallbacks = _fallback_models(self.config, tier, provider)
+            if fallbacks:
+                kwargs["fallback_model_names"] = fallbacks
 
         deep_client = create_llm_client(
             provider=deep_provider,

@@ -6,6 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Changes that need action when upgrading are listed first in their release.
 
+## [0.6.0] - 2026-10-26
+
+### Phase 1: Core Reliability
+
+#### LLM Pipeline Hardening
+- **Provider-agnostic fallback chains** — cross-provider fallback chains via `TRADINGAGENTS_QUICK_FALLBACK_BY_PROVIDER` / `TRADINGAGENTS_DEEP_FALLBACK_BY_PROVIDER`
+- **OpenRouter native fallback** — uses `models` array in single request (capped at 3), no extra round-trips
+- **Client-side fallback** — sequential retry on 429/capacity/unavailable for all providers
+- **Per-tier fallback chains** — quick tier (analysts/trader/risk) and deep tier (managers) have independent fallback chains
+- **NVIDIA Nemotron + Gemma-4 support** — fallback models from NVIDIA NIM API
+
+#### Crypto-Native Data Layer
+- **ccxt OHLCV vendor** — Binance + Bybit support for spot/futures (`tradingagents/dataflows/vendors/ccxt/ohlcv.py`)
+- **Auto-routing** — crypto symbols (`BTC-USD`, `ETH-USD`, `SOL-USD` + 100+) auto-route to ccxt
+- **Multi-venue fallback** — vendor chain: `ccxt(binance),ccxt(bybit),yfinance` with ordered fallback
+- **Point-in-time validation** — dual stale check: day-level (backtest) + minute-level (live, 30 min max staleness)
+- **Configurable exchange** — `ccxt_exchange` (binance/bybit), `ccxt_market_type` (spot/futures)
+- **Default vendor chain** — `core_stock_apis: "ccxt(binance),ccxt(bybit),yfinance"`
+
+#### Configuration
+- New env vars: `TRADINGAGENTS_QUICK_FALLBACK_BY_PROVIDER`, `TRADINGAGENTS_DEEP_FALLBACK_BY_PROVIDER`
+- New config keys: `ccxt_exchange`, `ccxt_market_type`, `ccxt_market_type`
+- Quick tier: OpenRouter + Sonnet 5 (tool-capable) with cross-provider fallbacks
+- Deep tier: OpenRouter + Opus 5.5 with cross-provider fallbacks
+- NVIDIA Gemma-4 fallbacks for both tiers
+
+#### Configuration via Environment
+```bash
+# Quick tier (analysts/trader/risk)
+TRADINGAGENTS_QUICK_PROVIDER=openrouter
+TRADINGAGENTS_QUICK_THINK_LLM=anthropic/claude-sonnet-5
+TRADINGAGENTS_QUICK_FALLBACK_BY_PROVIDER={"openrouter": "google/gemini-3.8-flash,deepseek/deepseek-chat,xai/grok-4.6", "nvidia": "google/gemma-4-26b-it,google/gemma-4-12b-it"}
+
+# Deep tier (managers)
+TRADINGAGENTS_DEEP_PROVIDER=openrouter
+TRADINGAGENTS_DEEP_THINK_LLM=anthropic/claude-opus-5-5
+TRADINGAGENTS_DEEP_FALLBACK_BY_PROVIDER={"openrouter": "anthropic/claude-fable-5-1,google/gemini-3.1-pro-preview,xai/grok-4.6", "nvidia": "google/gemma-4-26b-it"}
+
+# Crypto data
+TRADINGAGENTS_CORE_STOCK_APIS="ccxt(binance),ccxt(bybit),yfinance"
+TRADINGAGENTS_CCXT_EXCHANGE=binance
+TRADINGAGENTS_CCXT_MARKET_TYPE=spot
+```
+
 ## [Unreleased]
 
 Execution bridge L2: a risk guard over the audit log, multi-exchange support,

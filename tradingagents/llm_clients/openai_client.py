@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
+from .fallback import create_fallback_chain
 from .validators import validate_model
 
 logger = logging.getLogger(__name__)
@@ -517,12 +518,10 @@ class OpenAIClient(BaseLLMClient):
                 continue
             llm_kwargs[key] = self.kwargs[key]
 
-        # OpenRouter model fallbacks: the request's "models" list is tried in
-        # order (primary first) when an upstream is rate-limited or down.
-        # OpenRouter 400s on more than 3 entries, so the chain is truncated.
-        fallbacks = self.kwargs.get("fallback_models")
-        if self.provider == "openrouter" and fallbacks:
-            chain = [self.model] + [m for m in fallbacks if m != self.model]
+        # Handle fallback models (support both old and new config keys for backward compat)
+        fallback_names = self.kwargs.get("fallback_model_names") or self.kwargs.get("fallback_models") or []
+        if fallback_names and self.provider == "openrouter":
+            chain = [self.model] + [m for m in fallback_names if m != self.model]
             if len(chain) > _OPENROUTER_MAX_MODELS:
                 logger.warning(
                     "OpenRouter accepts at most %d models per request; dropping %s",
@@ -531,6 +530,7 @@ class OpenAIClient(BaseLLMClient):
                 chain = chain[:_OPENROUTER_MAX_MODELS]
             llm_kwargs["extra_body"] = {"models": chain}
 
+        # Streaming config
         llm_kwargs["streaming"] = True
         if "stream_chunk_timeout" in getattr(chat_cls, "model_fields", {}):
             llm_kwargs.setdefault(
@@ -538,8 +538,20 @@ class OpenAIClient(BaseLLMClient):
                 llm_kwargs.get("timeout", _DEFAULT_REQUEST_TIMEOUT),
             )
 
+        # Build the primary model
+        primary_model = chat_cls(**llm_kwargs)
+
+        # Other providers: client-side fallback wrapper
+        if fallback_names and self.provider != "openrouter":
+            def make_fallback(model_name: str):
+                fallback_kwargs = dict(llm_kwargs)
+                fallback_kwargs["model"] = model_name
+                return chat_cls(**fallback_kwargs)
+
+            return create_fallback_chain(primary_model, make_fallback, fallback_names)
+
         # The subclass (provider quirks) comes from the registry spec.
-        return chat_cls(**llm_kwargs)
+        return primary_model
 
     def validate_model(self) -> bool:
         """Validate model for the provider."""

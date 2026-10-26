@@ -22,11 +22,17 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_DEEP_PROVIDER":        "deep_provider",
     "TRADINGAGENTS_QUICK_BACKEND_URL":    "quick_backend_url",
     "TRADINGAGENTS_DEEP_BACKEND_URL":     "deep_backend_url",
-    # OpenRouter-only fallback chain per tier, comma-separated model IDs tried
-    # in order after the tier's primary model (sent as the request's "models"
-    # list, so OpenRouter fails over on 429/5xx/unavailable upstreams).
+    # Per-tier fallback model chains (comma-separated model IDs tried in order
+    # after the tier's primary model). Works for ANY provider:
+    # - OpenRouter: native API fallback via "models" list (fastest, no extra round-trips)
+    # - Other providers: client-side retry on rate-limit/unavailable errors
+    # Format: "model-a,model-b,model-c" or JSON list '["model-a","model-b"]'
     "TRADINGAGENTS_QUICK_FALLBACK_MODELS": "quick_fallback_models",
     "TRADINGAGENTS_DEEP_FALLBACK_MODELS":  "deep_fallback_models",
+    # Optional: provider-specific fallback override (JSON: {"provider": "model-a,model-b"}).
+    # When set, overrides the tier-level fallback for that provider.
+    "TRADINGAGENTS_QUICK_FALLBACK_BY_PROVIDER": "quick_fallback_by_provider",
+    "TRADINGAGENTS_DEEP_FALLBACK_BY_PROVIDER":  "deep_fallback_by_provider",
     # Wire protocol for OpenAI-compatible endpoints: "chat" (default) speaks
     # Chat Completions; "responses" switches to /responses for endpoints that
     # implement it. Validated in build_llm_kwargs.
@@ -152,10 +158,14 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "deep_provider": None,
     "quick_backend_url": None,
     "deep_backend_url": None,
-    # OpenRouter fallback chains (comma-separated model IDs; "" = primary only).
-    # Ignored for every other provider.
+    # Per-tier fallback model chains (comma-separated model IDs; "" = primary only).
+    # Works for ANY provider: OpenRouter uses native API; others use client-side retry.
     "quick_fallback_models": "",
     "deep_fallback_models": "",
+    # Optional provider-specific fallback override: {"provider": "model-a,model-b"}.
+    # When set for a provider, overrides the tier-level fallback for that provider.
+    "quick_fallback_by_provider": {},
+    "deep_fallback_by_provider": {},
     # Wire protocol for OpenAI-compatible endpoints: "chat" (Chat Completions,
     # the wide-compatibility default) or "responses" (/responses for endpoints
     # that implement it). Native OpenAI ignores this -- it already prefers
@@ -213,7 +223,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # routed to vendors you didn't choose. For ordered fallback, list several,
     # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
     "data_vendors": {
-        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
+        "core_stock_apis": "ccxt(binance),ccxt(bybit),yfinance",  # Options: ccxt, alpha_vantage, yfinance
         "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
         "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
         "news_data": "yfinance",             # Options: alpha_vantage, yfinance
@@ -224,6 +234,9 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "tool_vendors": {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
     },
+    # ccxt exchange selection for crypto OHLCV
+    "ccxt_exchange": "binance",              # Options: binance, bybit
+    "ccxt_market_type": "spot",              # Options: spot, futures
     # Benchmark for alpha calculation in the reflection layer.
     # ``benchmark_ticker`` (when set) overrides the suffix map for all
     # tickers; leave it None to use ``benchmark_map`` for auto-detection

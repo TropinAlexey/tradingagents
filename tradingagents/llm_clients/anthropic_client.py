@@ -4,6 +4,7 @@ from typing import Any
 from langchain_anthropic import ChatAnthropic
 
 from .base_client import BaseLLMClient, normalize_content
+from .fallback import create_fallback_chain
 from .validators import validate_model
 
 _PASSTHROUGH_KWARGS = (
@@ -71,7 +72,20 @@ class AnthropicClient(BaseLLMClient):
                 continue
             llm_kwargs[key] = self.kwargs[key]
 
-        return NormalizedChatAnthropic(**llm_kwargs)
+        # Build the primary model
+        primary_model = NormalizedChatAnthropic(**llm_kwargs)
+
+        # Handle fallback models (provider-agnostic client-side fallback)
+        fallback_names = self.kwargs.get("fallback_model_names") or []
+        if fallback_names:
+            def make_fallback(model_name: str):
+                fallback_kwargs = dict(llm_kwargs)
+                fallback_kwargs["model"] = model_name
+                return NormalizedChatAnthropic(**fallback_kwargs)
+
+            return create_fallback_chain(primary_model, make_fallback, fallback_names)
+
+        return primary_model
 
     def validate_model(self) -> bool:
         """Validate model for Anthropic."""
