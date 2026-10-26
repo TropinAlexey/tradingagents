@@ -242,3 +242,7 @@ nul
 
 # Archived legacy runtime state (control.db / JSONL stores) after the PostgreSQL cutover
 archive/
+
+# Local scratch files
+/TODO
+/TradingAgentsHelp
