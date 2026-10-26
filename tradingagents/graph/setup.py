@@ -1,23 +1,19 @@
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import ToolNode
 
 from tradingagents.agents import (
     create_aggressive_debator,
     create_bear_researcher,
     create_bull_researcher,
     create_conservative_debator,
-    create_fundamentals_analyst,
-    create_market_analyst,
     create_msg_delete,
     create_neutral_debator,
-    create_news_analyst,
     create_portfolio_manager,
     create_research_manager,
-    create_sentiment_analyst,
     create_trader,
 )
+from tradingagents.agents.analysts.parallel import run_analysts_parallel_sync
 from tradingagents.agents.state import AgentState
 
 from .analyst_execution import build_analyst_execution_plan
@@ -73,14 +69,12 @@ class GraphSetup:
                 - "news": News analyst
                 - "fundamentals": Fundamentals analyst
         """
-        plan = build_analyst_execution_plan(selected_analysts)
+        build_analyst_execution_plan(selected_analysts)
 
-        analyst_factories = {
-            "market": lambda: create_market_analyst(self.quick_thinking_llm),
-            "social": lambda: create_sentiment_analyst(self.quick_thinking_llm),
-            "news": lambda: create_news_analyst(self.quick_thinking_llm),
-            "fundamentals": lambda: create_fundamentals_analyst(self.quick_thinking_llm),
-        }
+        # Create a single parallel node for all analysts
+        def parallel_analysts_node(state):
+            """Run all analysts in parallel and combine their reports."""
+            return run_analysts_parallel_sync(state, self.quick_thinking_llm)
 
         bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)
         bear_researcher_node = create_bear_researcher(self.quick_thinking_llm)
@@ -94,11 +88,9 @@ class GraphSetup:
 
         workflow = StateGraph(AgentState)
 
-        for spec in plan.specs:
-            workflow.add_node(spec.agent_node, analyst_factories[spec.key]())
-            workflow.add_node(spec.clear_node, create_msg_delete())
-            if spec.tools:
-                workflow.add_node(spec.tool_node, ToolNode(list(spec.tools)))
+        # Add the parallel analysts node (replaces sequential analyst nodes)
+        workflow.add_node("Parallel Analysts", parallel_analysts_node)
+        workflow.add_node("Msg Clear Analysts", create_msg_delete())
 
         workflow.add_node("Bull Researcher", bull_researcher_node)
         workflow.add_node("Bear Researcher", bear_researcher_node)
@@ -109,20 +101,10 @@ class GraphSetup:
         workflow.add_node("Conservative Analyst", conservative_analyst)
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
 
-        workflow.add_edge(START, plan.specs[0].agent_node)
-
-        for i, spec in enumerate(plan.specs):
-            if spec.tools:
-                workflow.add_conditional_edges(
-                    spec.agent_node, _tools_or_clear(spec), [spec.tool_node, spec.clear_node]
-                )
-                workflow.add_edge(spec.tool_node, spec.agent_node)
-            else:
-                workflow.add_edge(spec.agent_node, spec.clear_node)
-
-            # The last analyst hands over to the research debate.
-            following = plan.specs[i + 1].agent_node if i < len(plan.specs) - 1 else "Bull Researcher"
-            workflow.add_edge(spec.clear_node, following)
+        # Start with parallel analysts
+        workflow.add_edge(START, "Parallel Analysts")
+        workflow.add_edge("Parallel Analysts", "Msg Clear Analysts")
+        workflow.add_edge("Msg Clear Analysts", "Bull Researcher")
 
         # Both research-debate edges share the complete DEBATE_PATH_MAP (#1088).
         for debate_node in ("Bull Researcher", "Bear Researcher"):
