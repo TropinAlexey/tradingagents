@@ -86,6 +86,7 @@ _ALLOWED: dict[str, dict] = {
 
 _GATE_KEYS = {key for key, meta in _ALLOWED.items() if meta["gate"]}
 ALLOWED_KEYS = frozenset(_ALLOWED)
+GATE_KEYS = frozenset(_GATE_KEYS)
 
 
 def _coerce(key: str, value):

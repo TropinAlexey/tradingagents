@@ -4,6 +4,7 @@ import typer
 
 from cli.display import console
 from cli.run import run_analysis
+from cli.server import register as register_server_commands
 from tradingagents.backtest import iter_grid, run_backtest, summarize
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.portfolio import load_portfolio
@@ -124,6 +125,9 @@ def backtest(
         console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
     for ticker, reason in result.settlement_failures:
         console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
+
+
+register_server_commands(app)
 
 
 if __name__ == "__main__":
